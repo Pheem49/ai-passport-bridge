@@ -9,13 +9,7 @@
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgray?style=flat-square" alt="Platforms" />
 </p>
 
-<img width="2048" height="1055" alt="Terminal Chat Demo" src="https://github.com/user-attachments/assets/fa865ce3-7cf1-41f9-b98e-1f5a489a7619" />
-
-<img width="2048" height="1332" alt="Model Picker & Slash Commands" src="https://github.com/user-attachments/assets/101dcb7c-8e20-47f1-8858-de43aa06bc8f" />
-
-<img width="2904" height="1444" alt="Agent Loop & Diff Viewer" src="https://github.com/user-attachments/assets/0715f177-0ac0-476a-a175-46661e99cf89" />
-
-https://github.com/user-attachments/assets/56975f8d-a9ad-4562-9e00-422078cc66a2
+![aipass terminal chat](./public/image.png)
 
 ---
 

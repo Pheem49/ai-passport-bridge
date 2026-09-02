@@ -81,6 +81,7 @@ const italic = sgr(3);
 const underline = sgr(4);
 const red = sgr(31);
 const green = sgr(32);
+const yellow = sgr(33);
 const cyan = sgr(36);
 const gray = sgr(90);
 
@@ -1285,7 +1286,10 @@ const HELP = [...COMMANDS.map(([n, d]) => `  ${n.padEnd(CMD_PAD)}  ${d}`), `  ${
 banner();
 
 const rl = readline.createInterface({ input: stdin, output: stdout });
-rl.on('SIGINT', () => { out(); rl.close(); process.exit(0); });
+rl.on('SIGINT', () => {
+  if (rl.line.length > 0) setLine('');
+  handleExit('Ctrl+C');
+});
 
 if (TTY) {
   // Enable bracketed paste mode in terminal so pasted text (Ctrl+V) doesn't auto-submit on newline
@@ -1352,6 +1356,48 @@ const boxRule = (/** @type {string} */ l, /** @type {string} */ r) =>
   gray(l + '─'.repeat(Math.max(2, termWidth() - 3)) + r); // full terminal width, -1 col so the corner never wraps
 const topRule = () => boxRule('╭', '╮');
 const botRule = () => boxRule('╰', '╯');
+const hintRule = (/** @type {string} */ sig) => {
+  const text = termWidth() >= 70
+    ? ` Press ${sig} again to exit (กดอีกครั้งเพื่อออก) `
+    : ` Press ${sig} again to exit `;
+  const rem = Math.max(2, termWidth() - 3 - 2 - text.length);
+  return gray('╰─') + yellow(text) + gray('─'.repeat(rem) + '╯');
+};
+
+/** @type {ReturnType<typeof setTimeout> | null} */
+let exitTimer = null;
+
+function clearInputBox() {
+  if (!TTY) return;
+  if (menuOpen) {
+    stdout.write('\x1b[J');
+    menuOpen = false;
+  }
+  // Wipe bottom border, then move up to mode banner and wipe down
+  stdout.write('\r\n\x1b[J\x1b[3A\r\x1b[J');
+}
+
+/** @param {string} [sig] */
+function handleExit(sig = 'Ctrl+C') {
+  if (!TTY) {
+    rl.close();
+    process.exit(0);
+  }
+
+  if (exitTimer !== null) {
+    clearTimeout(exitTimer);
+    exitTimer = null;
+    clearInputBox();
+    rl.close();
+    process.exit(0);
+  }
+
+  stdout.write(`\r\n\x1b[J${hintRule(sig)}\x1b[1A\x1b[${promptCol()}G`);
+  exitTimer = setTimeout(() => {
+    exitTimer = null;
+    if (TTY && !menuOpen) drawBottomFrame();
+  }, 2000);
+}
 
 let menuOpen = false;
 /** @type {Array<[string, string]>} rows currently shown (real matches only) */
@@ -1414,8 +1460,27 @@ function drawMenu({ keepSel = false } = {}) {
 }
 
 if (TTY) {
-  stdin.on('keypress', (/** @type {string} */ _ch, /** @type {import('node:readline').Key} */ key) => {
+  // Wrap internal readline keypress listener so we can intercept Ctrl+D on empty prompt
+  const [rlKeypressListener] = stdin.rawListeners('keypress');
+  if (rlKeypressListener) stdin.removeListener('keypress', rlKeypressListener);
+
+  stdin.on('keypress', (/** @type {string} */ ch, /** @type {import('node:readline').Key} */ key) => {
     const name = key?.name;
+
+    if (key?.ctrl && name === 'd' && rl.line.length === 0) {
+      handleExit('Ctrl+D');
+      return;
+    }
+
+    if (exitTimer !== null && !(key?.ctrl && (name === 'c' || name === 'd'))) {
+      clearTimeout(exitTimer);
+      exitTimer = null;
+      drawBottomFrame();
+    }
+
+    if (rlKeypressListener) {
+      /** @type {any} */ (rlKeypressListener).call(stdin, ch, key);
+    }
 
     if (menuOpen && (name === 'up' || name === 'down')) {
       const n = menuHits.length;
@@ -1495,7 +1560,7 @@ function pickList(items, { current, label }) {
       else if (n === 'down') { sel = (sel + 1) % items.length; paint(); }
       else if (n === 'return') finish(items[sel]);
       else if (n === 'escape') finish(null);
-      else if (key?.ctrl && n === 'c') { finish(null); process.exit(0); }
+      else if (key?.ctrl && n === 'c') finish(null);
     };
 
     stdin.on('keypress', onKey);
@@ -1533,8 +1598,14 @@ for (;;) {
     if (TTY) drawBottomFrame();
     line = await Promise.race([p, closed]);
   }
-  catch { break; } // Ctrl+C / Ctrl+D
-  if (line === CLOSED) { if (TTY) out(); break; }
+  catch {
+    if (TTY) clearInputBox();
+    break;
+  } // Ctrl+C / Ctrl+D
+  if (line === CLOSED) {
+    if (TTY) clearInputBox();
+    break;
+  }
   if (TTY && menuOpen) { stdout.write('\x1b[J'); menuOpen = false; } // clear the dropdown
   if (TTY) out(botRule()); // close the input frame under the submitted line
   if (pendingPick) { line = pendingPick; pendingPick = null; }
