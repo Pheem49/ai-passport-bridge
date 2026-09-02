@@ -239,8 +239,8 @@ Run the comprehensive test suite (45 integration and unit tests covering WAF eva
 npm test
 ```
 
----
+## 📄 Credits & License
 
-## 📄 License
+This project is a fork of the original work by [niawjunior](https://github.com/niawjunior) from **[niawjunior/aipass-bridge](https://github.com/niawjunior/aipass-bridge)**, with enhancements, TUI overhauls, and autonomous tooling by **[Pheem49](https://github.com/Pheem49)**.
 
-MIT © Pheem49
+Released under the [MIT License](LICENSE).
