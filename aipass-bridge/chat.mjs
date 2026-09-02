@@ -414,8 +414,8 @@ function banner() {
 // One source of truth for the slash commands: the /help text and the live menu.
 /** @type {Array<[string, string]>} */
 const COMMANDS = [
-  ['/models', 'list available models'],
-  ['/model', 'switch model — /model <id>'],
+  ['/model', 'pick a model — ↑↓ then Enter, or /model <id>'],
+  ['/models', 'print the model list'],
   ['/conversations', 'switch conversation — ↑↓ then Enter'],
   ['/new', 'start a fresh conversation'],
   ['/clear', 'clear the screen'],
@@ -513,7 +513,7 @@ if (TTY) {
     if (menuOpen && name === 'tab') {
       const pick = menuHits[menuSel]?.[0];
       closeMenu();
-      if (pick) setLine(pick === '/model' ? `${pick} ` : pick);
+      if (pick) setLine(pick);
       return;
     }
     if (menuOpen && name === 'escape') { closeMenu(); return; }
@@ -523,36 +523,36 @@ if (TTY) {
   });
 }
 
-/**
- * @typedef {{ id: string, title?: string, updatedAt?: string }} ConvRow
- */
+/** @typedef {{ id: string, title?: string, updatedAt?: string }} ConvRow */
+/** @typedef {{ id: string, name?: string, free_credit?: boolean, thinking?: unknown }} ModelRow */
 
 /**
- * Full-screen-ish picker: renders the conversation list, ↑/↓ moves the cursor,
- * Enter selects, Esc cancels. Takes the keyboard away from readline for the
- * duration (its keypress listeners are detached and restored on exit) so arrow
- * keys don't leak into history navigation.
- * @param {ConvRow[]} convs   newest-first
- * @param {string | null} current   id of the active conversation
- * @returns {Promise<ConvRow | null>}
+ * Modal ↑/↓ picker (same interaction as the mockup for /conversations): renders
+ * `items`, ↑/↓ moves the cursor, Enter selects, Esc cancels. Takes the keyboard
+ * away from readline for the duration — its keypress listeners are detached and
+ * restored on exit — so arrows don't leak into history navigation.
+ * @template {{ id: string }} T
+ * @param {T[]} items
+ * @param {{ current: string | null, label: (item: T) => [string, string] }} opts
+ *        `label` returns [main text, dim right-hand note] for each row.
+ * @returns {Promise<T | null>}
  */
-function pickConversation(convs, current) {
+function pickList(items, { current, label }) {
   return new Promise((resolve) => {
-    let sel = Math.max(0, convs.findIndex((c) => c.id === current));
+    let sel = Math.max(0, items.findIndex((it) => it.id === current));
     let painted = 0;
-    const titleW = Math.min(fmtWidth() - 18, 48);
+    const mainW = Math.min(fmtWidth() - 20, 44);
 
     const paint = () => {
       if (painted) stdout.write(`\x1b[${painted}A`);
       stdout.write('\r\x1b[J');
-      const rows = [dim(`  ↑↓ choose · Enter switch · Esc cancel`)];
-      convs.forEach((c, i) => {
-        const here = c.id === current ? green('●') : ' ';
+      const rows = [dim('  ↑↓ choose · Enter select · Esc cancel')];
+      items.forEach((it, i) => {
+        const [main, note] = label(it);
+        const here = it.id === current ? green('●') : ' ';
         const cur = i === sel ? cyan('›') : ' ';
-        const title = truncate(c.title || '(untitled)', titleW).padEnd(titleW);
-        const when = dim((relative(c.updatedAt) || '').padStart(9));
-        const t = i === sel ? cyan(title) : title;
-        rows.push(`  ${cur} ${here} ${t}  ${when}`);
+        const m = truncate(main, mainW).padEnd(mainW);
+        rows.push(`  ${cur} ${here} ${i === sel ? cyan(m) : m}  ${dim(note)}`);
       });
       stdout.write(rows.join('\n') + '\n');
       painted = rows.length;
@@ -562,7 +562,7 @@ function pickConversation(convs, current) {
     const rlKeys = /** @type {any} */ (stdin.listeners('keypress'));
     for (const l of rlKeys) stdin.off('keypress', l);
 
-    /** @param {ConvRow | null} choice */
+    /** @param {T | null} choice */
     const finish = (choice) => {
       stdin.off('keypress', onKey);
       for (const l of rlKeys) stdin.on('keypress', l);
@@ -573,9 +573,9 @@ function pickConversation(convs, current) {
     /** @param {string} _ch @param {import('node:readline').Key} [key] */
     const onKey = (_ch, key) => {
       const n = key?.name;
-      if (n === 'up') { sel = (sel - 1 + convs.length) % convs.length; paint(); }
-      else if (n === 'down') { sel = (sel + 1) % convs.length; paint(); }
-      else if (n === 'return') finish(convs[sel]);
+      if (n === 'up') { sel = (sel - 1 + items.length) % items.length; paint(); }
+      else if (n === 'down') { sel = (sel + 1) % items.length; paint(); }
+      else if (n === 'return') finish(items[sel]);
       else if (n === 'escape') finish(null);
       else if (key?.ctrl && n === 'c') { finish(null); process.exit(0); }
     };
@@ -609,7 +609,7 @@ for (;;) {
   if (line === '/clear') { stdout.write(TTY ? '\x1b[2J\x1b[H' : '\n'); banner(); continue; }
 
   if (line === '/models') {
-    const r = /** @type {{ data?: Array<{ id: string, name?: string, free_credit?: boolean }> } | null} */ (
+    const r = /** @type {{ data?: ModelRow[] } | null} */ (
       await fetch(`${BRIDGE}/v1/models`).then((x) => x.json()).catch(() => null)
     );
     if (!r?.data) { console.log(red('  could not list models')); continue; }
@@ -620,8 +620,33 @@ for (;;) {
     continue;
   }
 
-  if (line.startsWith('/model ')) {
-    model = line.slice(7).trim();
+  // `/model` on its own opens an ↑/↓ picker; `/model <id>` switches directly.
+  if (line === '/model' || line.startsWith('/model ')) {
+    let id = line === '/model' ? '' : line.slice(7).trim();
+    if (!id) {
+      const r = /** @type {{ data?: ModelRow[] } | null} */ (
+        await fetch(`${BRIDGE}/v1/models`).then((x) => x.json()).catch(() => null)
+      );
+      const models = r?.data ?? [];
+      if (!models.length) { console.log(red('  could not list models')); continue; }
+      if (!TTY) {
+        for (const m of models) console.log(`  ${m.id === model ? '●' : ' '} ${m.id}${m.free_credit ? dim('  free') : ''}`);
+        continue;
+      }
+      const chosen = await pickList(models, {
+        current: model,
+        label: (m) => {
+          const tags = [];
+          if (m.free_credit) tags.push('free');
+          if (Array.isArray(m.thinking) && m.thinking.length) tags.push('thinking');
+          return [m.id, tags.join(' · ')];
+        },
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      id = chosen.id;
+    }
+    if (id === model) { console.log(dim('  already on that model')); continue; }
+    model = id;
     await fetch(`${BRIDGE}/config`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ defaultModel: model }),
@@ -644,7 +669,10 @@ for (;;) {
       continue;
     }
 
-    const chosen = await pickConversation(list, current);
+    const chosen = await pickList(list, {
+      current,
+      label: (c) => [c.title || '(untitled)', (relative(c.updatedAt) || '').padStart(9)],
+    });
     if (all.length > list.length) console.log(dim(`  (showing ${list.length} most recent of ${all.length})`));
     if (!chosen) { console.log(dim('  cancelled')); continue; }
     if (chosen.id === current) { console.log(dim('  already on that one')); continue; }
