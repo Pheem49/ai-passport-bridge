@@ -108,7 +108,7 @@ const sendToClient = (client, event, data) =>
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 class Job {
-  constructor({ kind = 'chat', modelId, text, conversationId, url, message, requestId, assistant, assistantField, timeoutMs, onDelta, onDone, onError }) {
+  constructor({ kind = 'chat', modelId, text, parts, conversationId, url, message, requestId, assistant, assistantField, timeoutMs, onDelta, onDone, onError }) {
     this.id = randomUUID();
     this.kind = kind;
     this.url = url;
@@ -119,6 +119,7 @@ class Job {
     this.timeoutMs = timeoutMs ?? IDLE_TIMEOUT_MS;
     this.modelId = modelId;
     this.text = text;
+    this.parts = parts;
     this.conversationId = conversationId;
     this.onDelta = onDelta;
     this.onDone = onDone;
@@ -139,7 +140,7 @@ class Job {
       ? { jobId: this.id, kind: 'loader', url: this.url }
       : this.kind === 'create'
       ? { jobId: this.id, kind: 'create', modelId: this.modelId, message: this.message, requestId: this.requestId, assistant: this.assistant, assistantField: this.assistantField }
-      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text });
+      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text, parts: this.parts });
   }
   delta(part) { if (!this.settled) { this.touch(); this.onDelta(part); } }
   done(value) { if (this.settled) return; this.cleanup(); this.onDone(value ?? 'stop'); }
@@ -265,7 +266,7 @@ async function resolveConversation() {
 
 // A 404 means the conversation was deleted; a 409 means the server still
 // believes a generation is running there. Neither recovers on its own.
-function startChat({ modelId, text, onDelta, onDone, onError }) {
+function startChat({ modelId, text, parts, onDelta, onDone, onError }) {
   let attempts = 0;
   let delivered = 0;
   let current = null;
@@ -277,7 +278,7 @@ function startChat({ modelId, text, onDelta, onDone, onError }) {
     catch (err) { return onError(err.message); }
 
     current = new Job({
-      modelId, text, conversationId,
+      modelId, text, parts, conversationId,
       onDelta: (part) => { delivered++; onDelta(part); },
       onDone,
       onError: (message) => {
@@ -299,15 +300,100 @@ function startChat({ modelId, text, onDelta, onDone, onError }) {
   return { abort: () => current?.abort() };
 }
 
-// Only the newest user message is sent. The server holds the history, and a
-// messages array containing an assistant turn is rejected upstream.
-function lastUserText(messages) {
-  const texts = (messages ?? [])
-    .filter((m) => m.role === 'user')
-    .map((m) => (typeof m.content === 'string'
-      ? m.content
-      : (m.content ?? []).map((p) => (p?.type === 'text' ? p.text : '')).join('')));
-  return texts.at(-1)?.trim() ?? '';
+// Fetch remote image and convert to Base64 Data URI with SSRF guard
+async function fetchRemoteImageAsDataUri(urlStr) {
+  const parsed = new URL(urlStr);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`unsupported protocol: ${parsed.protocol}`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('172.16.') || host.startsWith('172.17.') || host.startsWith('172.18.') || host.startsWith('172.19.') || host.startsWith('172.2') || host.startsWith('172.30.') || host.startsWith('172.31.')) {
+    throw new Error(`refusing private/internal network fetch: ${host}`);
+  }
+
+  const res = await fetch(urlStr, {
+    signal: AbortSignal.timeout(15_000),
+    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+  });
+  if (!res.ok) throw new Error(`remote image fetch failed with status ${res.status}`);
+  const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+  if (!contentType.startsWith('image/')) {
+    throw new Error(`expected image content-type, got ${contentType}`);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
+    throw new Error(`image size too large: ${arrayBuffer.byteLength} bytes`);
+  }
+  const base64 = Buffer.from(arrayBuffer).toString('base64');
+  return `data:${contentType};base64,${base64}`;
+}
+
+// Extract multimodal parts (text and images) from OpenAI formatted messages
+async function extractUserParts(messages) {
+  const lastUser = (messages ?? []).filter((m) => m.role === 'user').at(-1);
+  if (!lastUser) return { text: '', parts: [] };
+
+  if (typeof lastUser.content === 'string') {
+    const text = lastUser.content.trim();
+    return {
+      text,
+      parts: text ? [{ type: 'text', text }] : []
+    };
+  }
+
+  if (Array.isArray(lastUser.content)) {
+    const parts = [];
+    const textPieces = [];
+
+    for (const item of lastUser.content) {
+      if (!item || typeof item !== 'object') continue;
+
+      if (item.type === 'text' && typeof item.text === 'string') {
+        const t = item.text.trim();
+        if (t) {
+          textPieces.push(t);
+          parts.push({ type: 'text', text: t });
+        }
+      } else if (item.type === 'image_url') {
+        const rawUrl = item.image_url?.url || item.url || (typeof item.image === 'string' ? item.image : null);
+        if (typeof rawUrl === 'string' && rawUrl.trim()) {
+          const urlStr = rawUrl.trim();
+          let dataUri = '';
+          if (urlStr.startsWith('data:image/')) {
+            dataUri = urlStr;
+          } else if (/^https?:\/\//i.test(urlStr)) {
+            try {
+              dataUri = await fetchRemoteImageAsDataUri(urlStr);
+            } catch (err) {
+              log(`warning: failed to fetch remote image ${urlStr}: ${err.message}`);
+            }
+          }
+          if (dataUri) {
+            parts.push({
+              type: 'image',
+              image: dataUri
+            });
+          }
+        }
+      } else if (item.type === 'image' || item.type === 'file') {
+        const raw = item.image || item.url || item.data || '';
+        if (typeof raw === 'string' && raw.trim()) {
+          parts.push({
+            type: 'image',
+            image: raw.trim()
+          });
+        }
+      }
+    }
+
+    const text = textPieces.join('\n').trim();
+    return {
+      text: text || (parts.length ? '[Image]' : ''),
+      parts: parts.length ? parts : (text ? [{ type: 'text', text }] : [])
+    };
+  }
+
+  return { text: '', parts: [] };
 }
 
 /* ------------------------------------------------------------ http plumbing */
@@ -347,12 +433,13 @@ async function chatCompletions(req, res) {
   catch { return oaiError(res, 400, 'invalid JSON body'); }
 
   const model = String(payload.model ?? defaultModel).replace(/^aipass\//, '');
-  const text = lastUserText(payload.messages);
-  if (!text) return oaiError(res, 400, 'no user message');
+  const { text, parts } = await extractUserParts(payload.messages);
+  if (!text && (!parts || parts.length === 0)) return oaiError(res, 400, 'no user message');
 
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
-  log(`chat -> ${model} (${Buffer.byteLength(text)} bytes)`);
+  const imageCount = (parts ?? []).filter(p => p.type === 'image').length;
+  log(`chat -> ${model} (${Buffer.byteLength(text)} bytes text${imageCount ? `, ${imageCount} image(s)` : ''})`);
 
   if (payload.stream) {
     res.writeHead(200, {
@@ -371,7 +458,7 @@ async function chatCompletions(req, res) {
     emit({ role: 'assistant', content: '' });
 
     const job = startChat({
-      modelId: model, text,
+      modelId: model, text, parts,
       onDelta: (part) => {
         if (part.kind === 'status') {
           if (TOOL_VISIBILITY === 'off') return;
@@ -401,7 +488,7 @@ async function chatCompletions(req, res) {
   let reasoning = '';
   await new Promise((resolve) => {
     const job = startChat({
-      modelId: model, text,
+      modelId: model, text, parts,
       onDelta: (p) => {
         if (p.kind === 'status') { if (TOOL_VISIBILITY !== 'off') reasoning += `${p.text}\n`; return; }
         if (p.kind === 'reasoning') reasoning += p.text;
@@ -532,6 +619,41 @@ const server = http.createServer(async (req, res) => {
         log(conversationCache ? `conversation ${conversationCache}` : 'conversation cleared');
       }
       return json(res, 200, { ok: true, defaultModel, assistant: assistantId || null, conversation: PINNED_CONVERSATION || conversationCache });
+    }
+
+    if (path === '/restart' && req.method === 'POST') {
+      json(res, 200, { ok: true, message: 'restarting bridge server' });
+      setTimeout(() => process.exit(0), 50);
+      return;
+    }
+
+    if (path === '/logs') {
+      const fs = await import('node:fs');
+      const target = url.searchParams.get('file') || 'bridge';
+      const logFile = `/var/log/${target}.log`;
+      try {
+        const content = fs.readFileSync(logFile, 'utf8');
+        return json(res, 200, { ok: true, file: logFile, lines: content.slice(-4000) });
+      } catch (err) {
+        return json(res, 500, { ok: false, error: err.message });
+      }
+    }
+
+    if (path === '/browser/restart' && req.method === 'POST') {
+      import('node:child_process').then(({ exec }) => {
+        exec('pkill -f chromium || pkill -f chrome || true');
+      });
+      return json(res, 200, { ok: true, message: 'restarting browser' });
+    }
+
+    if (path === '/ext/reload' && req.method === 'POST') {
+      for (const client of extClients) sendToClient(client, 'reload_extension', {});
+      return json(res, 200, { ok: true, message: 'reloading extension' });
+    }
+
+    if (path === '/tab/reload' && req.method === 'POST') {
+      for (const client of extClients) sendToClient(client, 'reload_tab', {});
+      return json(res, 200, { ok: true, message: 'reloading tab' });
     }
 
     if (path === '/ext/events' && req.method === 'GET') return extEvents(req, res);

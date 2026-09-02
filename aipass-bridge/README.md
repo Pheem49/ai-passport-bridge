@@ -67,6 +67,11 @@ or the `npm run …` scripts from the repo directory.
 Log in at `https://de.aipass.net/chat` and leave the tab open. The extension
 popup should read **connected**.
 
+> **Running on a server?** There's an optional headless Docker deployment in
+> [`deploy/`](deploy/README.md) — the same bridge and extension in a container
+> with a noVNC desktop, so it stays up 24/7 without your laptop. The core here
+> is unchanged; that folder only adds container plumbing.
+
 ### Check it
 
 ```bash
@@ -192,6 +197,39 @@ sources:
 Tool activity is sent as `reasoning_content`, so an OpenAI client that only
 reads `content` sees a clean answer. `AIPASS_TOOL_VISIBILITY=text` inlines it,
 `off` drops it.
+
+## From code
+
+The endpoint is OpenAI-compatible, so any SDK works — point it at
+`http://127.0.0.1:8787/v1` with any dummy key (auth is your browser session).
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="sk-dummy")
+stream = client.chat.completions.create(
+    model="gemini-3.1-flash-lite",
+    messages=[{"role": "user", "content": "Hello! What can you do?"}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+```typescript
+import OpenAI from "openai";
+
+const openai = new OpenAI({ baseURL: "http://127.0.0.1:8787/v1", apiKey: "sk-dummy" });
+const stream = await openai.chat.completions.create({
+  model: "gemini-3.1-flash-lite",
+  messages: [{ role: "user", content: "Tell me a fun fact." }],
+  stream: true,
+});
+for await (const chunk of stream) process.stdout.write(chunk.choices[0]?.delta?.content || "");
+```
+
+Send an `image_url` content part and the bridge uploads the image to aipass and
+attaches it — vision works on models that support it.
 
 ## Scope, and why
 

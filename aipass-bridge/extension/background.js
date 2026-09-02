@@ -14,8 +14,14 @@ let connected = false;
 let lastError = '';
 const jobTabs = new Map();
 
-const bridgeUrl = async () =>
-  (await chrome.storage.local.get('bridgeUrl')).bridgeUrl || DEFAULT_BRIDGE;
+const bridgeUrl = async () => {
+  try {
+    const res = await chrome.storage.local.get('bridgeUrl');
+    return res?.bridgeUrl || DEFAULT_BRIDGE;
+  } catch {
+    return DEFAULT_BRIDGE;
+  }
+};
 
 async function post(path, body) {
   try {
@@ -26,6 +32,7 @@ async function post(path, body) {
     });
   } catch (err) {
     lastError = String(err?.message ?? err);
+    console.warn('[aipass-bg] POST error:', path, lastError);
   }
 }
 
@@ -36,7 +43,7 @@ function queuePost(path, body) {
 }
 
 async function findChatTab() {
-  const tabs = await chrome.tabs.query({ url: 'https://de.aipass.net/*' });
+  const tabs = await chrome.tabs.query({ url: ['https://*.aipass.net/*', 'https://aipass.net/*'] });
   if (!tabs.length) return null;
   const live = tabs.filter((t) => !t.discarded && t.status !== 'unloaded');
   const pool = live.length ? live : tabs;
@@ -62,18 +69,19 @@ function waitForComplete(tabId, timeoutMs = 15_000) {
 // than telling the user to reload, put the scripts back.
 async function ensureContentScript(tab) {
   const ping = () => chrome.tabs.sendMessage(tab.id, { type: 'ping' });
-  try { await ping(); return; } catch { /* not there yet */ }
+  let ok = false;
+  try { await ping(); ok = true; } catch { /* not there yet */ }
 
-  if (tab.discarded || tab.status === 'unloaded') {
+  if (!ok && (tab.discarded || tab.status === 'unloaded')) {
     await chrome.tabs.reload(tab.id);
     await waitForComplete(tab.id);
-    try { await ping(); return; } catch { /* fall through to injection */ }
   }
 
-  // page.js first: content.js relays to it.
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', files: ['page.js'] });
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', files: ['content.js'] });
-  await ping();
+  await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', files: ['page.js'] }).catch(() => {});
+  if (!ok) {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', files: ['content.js'] }).catch(() => {});
+    await ping();
+  }
 }
 
 async function handleJob(job) {
@@ -101,6 +109,13 @@ function handleEvent(name, data) {
     const tabId = jobTabs.get(data.jobId);
     if (tabId != null) chrome.tabs.sendMessage(tabId, { type: 'abort', jobId: data.jobId }).catch(() => {});
     jobTabs.delete(data.jobId);
+  } else if (name === 'reload_extension') {
+    try { chrome.runtime.reload(); } catch { /* ignore */ }
+  } else if (name === 'reload_tab') {
+    (async () => {
+      const tab = await findChatTab();
+      if (tab) chrome.tabs.reload(tab.id).catch(() => {});
+    })();
   }
 }
 
@@ -197,7 +212,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // The worker can be evicted at any time; the alarm brings it back and the
 // connect() guard makes a duplicate call harmless.
-chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
+chrome.alarms.create('keepalive', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => connect());
 chrome.runtime.onStartup.addListener(() => connect());
 chrome.runtime.onInstalled.addListener(() => connect());
