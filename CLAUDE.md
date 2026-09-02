@@ -31,6 +31,14 @@ the bridge, CLIs, or tests. `npm install` is only for the Next.js app.
 | `npm run models` / `npm run conversations` | `list.mjs` printers |
 | `npm run dev:next` / `build` / `start` / `lint` | the Next.js app |
 
+`aipass-bridge/bin/aipass.mjs` is a `bin`-linked dispatcher (install:
+`aipass-bridge/install.sh` on POSIX, `install.ps1` on Windows): `aipass` /
+`aipass dev` / `aipass agent "task"` / `aipass models|conversations|status|stop`.
+Everything but `dev` auto-starts a detached bridge (`~/.aipass/bridge.{log,pid}`).
+It's a thin `spawn` wrapper over the same `*.mjs` files — the `npm run *` scripts
+stay the canonical way to run things. The whole `aipass-bridge/` tree is
+Windows-clean: no `/bin/sh`, no `diff` binary, `windowsHide` on the spawn.
+
 There is no lint/format config for `aipass-bridge/` itself; `npm run lint` is
 `eslint` for the Next.js app only.
 

@@ -2,6 +2,9 @@
   "name": "aipass",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "aipass": "aipass-bridge/bin/aipass.mjs"
+  },
   "scripts": {
     "dev": "node aipass-bridge/bridge/server.mjs",
     "test": "node --test aipass-bridge/test/*.test.mjs",

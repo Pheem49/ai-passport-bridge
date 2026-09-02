@@ -13,8 +13,7 @@
 // history the server already remembers.
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -240,7 +239,8 @@ const TOOLS = {
   run(_arg, body) {
     if (!ALLOW_RUN) return 'shell commands are disabled for this run';
     try {
-      return clip(execFileSync('/bin/sh', ['-c', body], { cwd: ROOT, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+      // execSync picks the platform shell: /bin/sh on POSIX, cmd.exe on Windows.
+      return clip(execSync(body, { cwd: ROOT, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] }));
     } catch (err) {
       return clip(`exit ${err.status}\n${String(err.stdout ?? '')}${String(err.stderr ?? '')}`);
     }
@@ -449,25 +449,90 @@ async function sayResilient(text, depth = 0) {
 
 /* ---------------------------------------------------------------- the loop */
 
+// Myers O(ND) line diff — no external `diff` binary, so it works the same on
+// Windows. Returns [{ t: ' '|'-'|'+', line }].
+function lineDiff(a, b) {
+  const N = a.length, M = b.length, MAX = N + M;
+  const trace = [];
+  let v = new Map([[1, 0]]);
+  let reached = false;
+  for (let d = 0; d <= MAX && !reached; d++) {
+    trace.push(new Map(v));
+    const next = new Map(v);
+    for (let k = -d; k <= d; k += 2) {
+      const down = k === -d || (k !== d && (v.get(k - 1) ?? -1) < (v.get(k + 1) ?? -1));
+      let x = down ? (v.get(k + 1) ?? 0) : (v.get(k - 1) ?? 0) + 1;
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) { x++; y++; }
+      next.set(k, x);
+      if (x >= N && y >= M) { reached = true; break; }
+    }
+    v = next;
+  }
+  const out = [];
+  let x = N, y = M;
+  for (let d = trace.length - 1; d >= 0 && (x > 0 || y > 0); d--) {
+    const vd = trace[d];
+    const k = x - y;
+    const down = k === -d || (k !== d && (vd.get(k - 1) ?? -1) < (vd.get(k + 1) ?? -1));
+    const pk = down ? k + 1 : k - 1;
+    const px = vd.get(pk) ?? 0;
+    const py = px - pk;
+    while (x > px && y > py) { out.push({ t: ' ', line: a[x - 1] }); x--; y--; }
+    if (d > 0) {
+      if (down) { out.push({ t: '+', line: b[y - 1] }); y--; }
+      else { out.push({ t: '-', line: a[x - 1] }); x--; }
+    }
+  }
+  return out.reverse();
+}
+
+// Print `d` as a coloured unified diff with `ctx` lines of context. Returns
+// false when there is nothing to show.
+function printUnified(d, ctx = 3) {
+  const n = d.length;
+  const keep = new Array(n).fill(false);
+  for (let i = 0; i < n; i++) {
+    if (d[i].t === ' ') continue;
+    for (let j = Math.max(0, i - ctx); j <= Math.min(n - 1, i + ctx); j++) keep[j] = true;
+  }
+  for (let i = 0; i < n; i++) {                 // bridge small gaps between hunks
+    if (keep[i]) continue;
+    let j = i; while (j < n && !keep[j]) j++;
+    if (i > 0 && j < n && j - i <= ctx) for (let k = i; k < j; k++) keep[k] = true;
+    i = j;
+  }
+  let oldLn = 0, newLn = 0, i = 0, shown = false;
+  while (i < n) {
+    if (!keep[i]) { if (d[i].t !== '+') oldLn++; if (d[i].t !== '-') newLn++; i++; continue; }
+    let j = i; while (j < n && keep[j]) j++;
+    const slice = d.slice(i, j);
+    let oc = 0, nc = 0;
+    for (const el of slice) { if (el.t !== '+') oc++; if (el.t !== '-') nc++; }
+    console.log(dim(`@@ -${oldLn + 1},${oc} +${newLn + 1},${nc} @@`));
+    for (const el of slice) {
+      const txt = el.t + el.line;
+      console.log(el.t === '+' ? green(txt) : el.t === '-' ? red(txt) : dim(txt));
+      if (el.t !== '+') oldLn++;
+      if (el.t !== '-') newLn++;
+    }
+    shown = true;
+    i = j;
+  }
+  return shown;
+}
+
 function showDiff() {
   if (!overlay.size) { console.log(dim('\nno file changes')); return; }
   console.log(bold(`\n${overlay.size} file(s) changed:\n`));
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aipass-'));
   for (const [abs, next] of overlay) {
     const rel = path.relative(ROOT, abs);
-    const a = path.join(tmp, 'a'); const b = path.join(tmp, 'b');
-    fs.writeFileSync(a, fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '');
-    fs.writeFileSync(b, next);
-    let diff;
-    try { diff = execFileSync('diff', ['-u', '--label', `a/${rel}`, '--label', `b/${rel}`, a, b], { encoding: 'utf8' }); }
-    catch (err) { diff = String(err.stdout ?? ''); }
-    for (const line of diff.split('\n')) {
-      if (line.startsWith('+') && !line.startsWith('+++')) console.log(green(line));
-      else if (line.startsWith('-') && !line.startsWith('---')) console.log(red(line));
-      else console.log(dim(line));
-    }
+    const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+    console.log(bold(`--- a/${rel}`));
+    console.log(bold(`+++ b/${rel}`));
+    if (!printUnified(lineDiff(before.split('\n'), next.split('\n')))) console.log(dim('  (no textual change)'));
+    console.log('');
   }
-  fs.rmSync(tmp, { recursive: true, force: true });
 }
 
 if (CONVERSATION) {

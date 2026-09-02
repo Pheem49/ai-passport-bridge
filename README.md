@@ -14,11 +14,42 @@ Two unrelated things share this directory:
 `aipass-bridge/` imports only `node:*` builtins — no `npm install` needed to run
 the bridge, the CLIs, or the tests. `npm install` is only for the Next.js app.
 
+## Quick start (any machine with Node ≥ 18)
+
+Nothing to build, nothing to `npm install`. On each machine:
+
+```bash
+git clone <repo> && cd aipass-bridge
+sh aipass-bridge/install.sh                                    # macOS / Linux
+Windows:
+   powershell -ExecutionPolicy Bypass -File aipass-bridge\install.ps1
+```
+
+`install.sh` symlinks `aipass` into `~/.local/bin` (or `~/bin`) if one is on your
+`PATH`; else it tries `npm link`; else it prints the manual options. `install.ps1`
+uses `npm link` (npm's global bin is on PATH by default on Windows). Both are
+idempotent — re-run any time, e.g. after moving the repo.
+
+Then, one time per browser:
+
+1. `chrome://extensions` → **Developer mode** → **Load unpacked** → select
+   `aipass-bridge/extension`
+2. open `https://de.aipass.net/chat` and leave the tab open
+
+```bash
+aipass status     # node / bridge / extension check
+aipass            # start chatting (auto-starts the bridge)
+```
+
+Full setup and usage: [`aipass-bridge/README.md`](./aipass-bridge/README.md).
+
 ## Commands
 
 | | |
 |---|---|
-| `npm run dev` | start the **bridge** on `:8787` |
+| `sh aipass-bridge/install.sh` | put the `aipass` command on your PATH (symlink into `~/.local/bin`, or `npm link`) |
+| `aipass` | open the chat (auto-starts the bridge); `aipass --help` for the rest |
+| `npm run dev` | start the **bridge** on `:8787` (what `aipass` auto-starts) |
 | `npm test` | the bridge/CLI test suite (`node --test aipass-bridge/test/*.test.mjs`) |
 | `npm run chat` / `npm run agent` / `npm run models` / `npm run conversations` | the CLIs (see `aipass-bridge/README.md`) |
 | `npm run dev:next` | start the Next.js app on `:3000` |

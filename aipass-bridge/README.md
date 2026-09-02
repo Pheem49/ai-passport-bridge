@@ -37,13 +37,63 @@ For the full structure and how every piece works, see [`DOCS.md`](./DOCS.md).
 
 ## Setup
 
+There is nothing to build and nothing to `npm install`. Everything under
+`aipass-bridge/` is `node:*` builtins, so on **any machine with Node ≥ 18** the
+same three steps apply — copy the repo over and run them again.
+
+### 1. Get the `aipass` command on your PATH
+
 ```bash
-npm run dev
+sh aipass-bridge/install.sh                                    # macOS / Linux
+powershell -ExecutionPolicy Bypass -File aipass-bridge\install.ps1   # Windows
 ```
 
-Load the extension: `chrome://extensions` → Developer mode → **Load unpacked**
-→ select `aipass-bridge/extension`. Then open a `https://de.aipass.net/chat`
-tab and leave it open; the popup should read **connected**.
+`install.sh` symlinks `aipass` into the first of `~/.local/bin` / `~/bin` that is
+already on your `PATH`; failing that it tries `npm link`; failing that it prints
+the manual options. `install.ps1` runs `npm link` (npm's global bin is on PATH by
+default on Windows). Both are idempotent — re-run any time, e.g. after moving the
+repo, which breaks the old link.
+
+Prefer not to install? Skip this step and use `node aipass-bridge/bin/aipass.mjs …`
+or the `npm run …` scripts from the repo directory.
+
+### 2. Load the extension (one time, per browser)
+
+`chrome://extensions` → **Developer mode** → **Load unpacked** → select
+`aipass-bridge/extension`.
+
+### 3. Open a de.aipass.net tab
+
+Log in at `https://de.aipass.net/chat` and leave the tab open. The extension
+popup should read **connected**.
+
+### Check it
+
+```bash
+aipass status     # node ≥ 18? bridge up? extension connected?
+```
+
+Then:
+
+```bash
+aipass            # start chatting — auto-starts the bridge in the background
+```
+
+| command | |
+|---|---|
+| `aipass` / `aipass "question"` | chat (interactive / one-shot) |
+| `aipass dev` | run the bridge in the foreground (Ctrl+C to stop) |
+| `aipass agent "task"` | file agent against **the current directory** |
+| `aipass models` · `aipass conversations` | the list printers |
+| `aipass status` | node / bridge / extension check |
+| `aipass stop` | stop a bridge that `aipass` auto-started |
+
+The auto-started bridge logs to `~/.aipass/bridge.log`; its pid is in
+`~/.aipass/bridge.pid`. Uninstall with `rm -f ~/.local/bin/aipass` (or
+`npm rm -g aipass` if you used `npm link`).
+
+Every machine talks to the **same de.aipass.net account** — chat history is
+shared, and only `gemini-3.1-flash-lite` is free-credit.
 
 ## Set up the coding assistant (one time)
 
@@ -92,8 +142,8 @@ wire the bridge to create bound conversations automatically — also below.
 ## Use it
 
 ```bash
-npm run chat                          # interactive
-npm run chat -- "ช่วยสรุปข่าว AI วันนี้"   # one-shot
+aipass                               # interactive   (or: npm run chat)
+aipass "ช่วยสรุปข่าว AI วันนี้"          # one-shot      (or: npm run chat -- "…")
 ```
 
 The interactive client streams the reply, renders it as markdown, shows
@@ -105,8 +155,8 @@ Type `/` to open the command menu — **↑/↓** to choose, **Tab** to fill it 
 
 | command | |
 |---|---|
-| `/models` | list models (marks the one in use and the free-credit ones) |
-| `/model <id>` | switch model |
+| `/model` | pick a model — an **↑/↓** picker (`●` marks the one in use); or `/model <id>` |
+| `/models` | print the model list |
 | `/conversations` | switch conversation — an **↑/↓** picker; **Enter** switches, **Esc** cancels |
 | `/new` | the *next* message starts a fresh conversation, titled by that message |
 | `/clear` | clear the screen |
@@ -413,3 +463,6 @@ filter is being modelled, pass `reject` to refuse payloads matching a pattern.
 - Every message appears in the account's chat history — this uses the real product.
 - Long sessions burn credits. Only `gemini-3.1-flash-lite` is free-credit;
   `npm run models` marks it.
+- Windows works (bridge, `aipass`, chat, agent — the diff and `RUN` use no Unix
+  tools). Use a VT-capable terminal: Windows Terminal, or `cmd`/PowerShell on
+  Windows 10 1809+.

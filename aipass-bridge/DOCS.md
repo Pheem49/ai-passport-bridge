@@ -107,6 +107,8 @@ Two facts explain the shape:
 
 ```
 aipass-bridge/
+├── bin/aipass.mjs     one-command dispatcher (`aipass` on PATH) — spawns the CLIs below
+├── install.sh / .ps1  put `aipass` on PATH (symlink → npm link on POSIX; npm link on Windows)
 ├── bridge/
 │   ├── server.mjs     the bridge: HTTP surface + job hub + turbo-stream + conversation logic
 │   └── package.json    { "type": "module", engines.node >= 18 } — no dependencies
@@ -407,15 +409,17 @@ lines, no dependencies.
 | `SEARCH <text>` | grep the tree → `file:line: excerpt` (max 50 hits) |
 | `EDIT <p>` / `FIND` … / `NEW` … / `END` | replace an exact snippet — refused unless `FIND` matches **one** place |
 | `CREATE <p>` … `END` | create / overwrite a file |
-| `RUN` … `END` | shell via `/bin/sh -c` — **only with `--allow-run`** |
+| `RUN` … `END` | shell via `execSync` (the platform shell: `/bin/sh` / `cmd.exe`) — **only with `--allow-run`** |
 | `DONE <summary>` | finish |
 
 ### Overlay filesystem
 
 Edits land in an in-memory `overlay: Map<absPath, contents>`. Reads consult the
 overlay first, so the model can read back its own pending work. `--apply`
-flushes the overlay to disk; without it you get a coloured `diff -u` and nothing
-is written. **`safe(p)`** resolves every path against `--root` and throws if it
+flushes the overlay to disk; without it you get a coloured unified diff and
+nothing is written. That diff is a small in-file Myers implementation
+(`lineDiff` + `printUnified`) — no `diff` binary, so it renders the same on
+Windows. **`safe(p)`** resolves every path against `--root` and throws if it
 escapes. `stripGutter()` removes the line-number prefix from a `FIND` block if
 *every* non-empty line carries one (so real code containing a `|` is left
 alone).
@@ -468,6 +472,30 @@ message.
 `node -e "…"` in `package.json`, on purpose: the agent reads `package.json`
 early in almost every task, and a script field shaped like code execution got
 the *whole read* `403`'d upstream.
+
+## The dispatcher (`bin/aipass.mjs`)
+
+The `aipass` command — a `bin` entry in the root `package.json`, installed by
+`install.sh` (POSIX: symlink into `~/.local/bin`, else `npm link`) or
+`install.ps1` (Windows: `npm link`). Zero dependencies: each subcommand just
+`spawn`s one of the sibling `*.mjs` files with `stdio: 'inherit'` (so the TUI's
+raw mode and `isTTY` pass straight through). The detached bridge spawn also
+passes `windowsHide: true`.
+
+- `aipass` / `aipass "q"` → `chat.mjs`; `dev` → `bridge/server.mjs` (foreground);
+  `agent "task"` → `agent.mjs` (whose `--root` already defaults to `cwd`);
+  `models` / `conversations` → `list.mjs`.
+- **Auto-start.** Every subcommand except `dev` calls `ensureBridge()`: if
+  `GET {BRIDGE}/status` doesn't answer, it `spawn`s the bridge **detached**
+  (`stdio` → `~/.aipass/bridge.log`, pid → `~/.aipass/bridge.pid`), `unref()`s
+  it, and polls `/status` for up to 4 s before continuing. `aipass stop` reads
+  the pidfile and kills it; a foreground `aipass dev` bridge is just Ctrl+C.
+- **`BRIDGE`** is derived from `AIPASS_HOST`/`AIPASS_PORT` and passed to every
+  child as `--bridge` (and `AIPASS_BRIDGE` for `list.mjs`), so a non-default port
+  is honoured end to end — which the bare `npm run *` scripts don't do.
+- `aipass status` runs no `ensureBridge` — it just reports Node version, whether
+  the bridge answers, the connected-extension count, and the current
+  model/conversation.
 
 ---
 
