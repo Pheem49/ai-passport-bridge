@@ -14,8 +14,9 @@ async function toWorker(payload, attempt = 0) {
   try {
     await chrome.runtime.sendMessage({ type: 'from-page', payload });
   } catch {
-    if (attempt >= 5) return;
-    setTimeout(() => toWorker(payload, attempt + 1), 200 * (attempt + 1));
+    const maxAttempts = payload?.kind === 'done' ? 30 : 12;
+    if (attempt >= maxAttempts) return;
+    setTimeout(() => toWorker(payload, attempt + 1), 150 * (attempt + 1));
   }
 }
 

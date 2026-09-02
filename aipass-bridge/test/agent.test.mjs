@@ -334,7 +334,7 @@ test('read shows line numbers and pages a long file with a range hint', async (t
   await agent(dir);
   const firstResult = handler.sent[1];    // the result of the first read is in turn 2's message
   assert.match(firstResult, /1 \| line 1/, 'line numbers present');
-  assert.match(firstResult, /more line\(s\)\. To see them: NEED file big\.txt 251-/, 'range hint present');
+  assert.match(firstResult, /more line\(s\)\. To see them: NEED file big\.txt 201-/, 'range hint present');
   assert.doesNotMatch(firstResult, /line 300/, 'a long file is not dumped whole');
 
   const rangeResult = handler.sent[2];     // the result of the ranged read

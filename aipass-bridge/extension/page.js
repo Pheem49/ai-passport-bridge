@@ -69,7 +69,11 @@
       buffer = [];
     };
     const ticker = setInterval(flush, 40);
-    const push = (kind, text) => { if (text) buffer.push({ kind, text }); };
+    const push = (kind, text) => {
+      if (!text) return;
+      buffer.push({ kind, text });
+      if (buffer.length >= 10) flush();
+    };
 
     try {
       // One user message, matching what the web UI sends. The server holds the

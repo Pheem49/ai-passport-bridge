@@ -29,6 +29,12 @@ async function post(path, body) {
   }
 }
 
+let postQueue = Promise.resolve();
+function queuePost(path, body) {
+  postQueue = postQueue.then(() => post(path, body)).catch(() => {});
+  return postQueue;
+}
+
 async function findChatTab() {
   const tabs = await chrome.tabs.query({ url: 'https://de.aipass.net/*' });
   if (!tabs.length) return null;
@@ -158,10 +164,19 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'from-page') {
     const p = msg.payload;
-    if (p.kind === 'chunk') post('/ext/chunk', { jobId: p.jobId, parts: p.parts });
-    else if (p.kind === 'done') { jobTabs.delete(p.jobId); post('/ext/done', { jobId: p.jobId, finishReason: p.finishReason }); }
-    else if (p.kind === 'error') { jobTabs.delete(p.jobId); post('/ext/error', { jobId: p.jobId, message: p.message }); }
-    else if (p.kind === 'loader') { jobTabs.delete(p.jobId); post('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message }); }
+    if (p.kind === 'chunk') queuePost('/ext/chunk', { jobId: p.jobId, parts: p.parts });
+    else if (p.kind === 'done') {
+      queuePost('/ext/done', { jobId: p.jobId, finishReason: p.finishReason })
+        .then(() => { jobTabs.delete(p.jobId); });
+    }
+    else if (p.kind === 'error') {
+      queuePost('/ext/error', { jobId: p.jobId, message: p.message })
+        .then(() => { jobTabs.delete(p.jobId); });
+    }
+    else if (p.kind === 'loader') {
+      queuePost('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message })
+        .then(() => { jobTabs.delete(p.jobId); });
+    }
     return;
   }
   if (msg?.type === 'status') {
