@@ -33,6 +33,8 @@ terminal ──HTTP──▶ bridge (node, no deps)
 page JavaScript inside a de.aipass.net tab, so Chrome attaches the session
 cookie itself. The bridge never sees it and nothing is stored on disk.
 
+For the full structure and how every piece works, see [`DOCS.md`](./DOCS.md).
+
 ## Setup
 
 ```bash
@@ -94,8 +96,23 @@ npm run chat                          # interactive
 npm run chat -- "ช่วยสรุปข่าว AI วันนี้"   # one-shot
 ```
 
-In interactive mode: `/models` lists what's available, `/model <id>` switches,
-Ctrl+C quits.
+The interactive client streams the reply, renders it as markdown, shows
+`web_search` progress as dim gutter lines with sources listed at the end, and
+frames the input in a prompt box. A braille spinner runs while you wait.
+
+Type `/` to open the command menu — **↑/↓** to choose, **Tab** to fill it in,
+**Enter** to run, **Esc** to dismiss:
+
+| command | |
+|---|---|
+| `/models` | list models (marks the one in use and the free-credit ones) |
+| `/model <id>` | switch model |
+| `/conversations` | switch conversation — an **↑/↓** picker; **Enter** switches, **Esc** cancels |
+| `/new` | the *next* message starts a fresh conversation, titled by that message |
+| `/clear` | clear the screen |
+| `/help` | list the commands |
+
+`Ctrl+C` quits. Piped or non-tty output stays plain — no cursor tricks, no box.
 
 | script | |
 |---|---|
@@ -332,8 +349,13 @@ npm run conversations     # list them, marking the one in use
 carries its own history, so reusing one drags in whatever was said before —
 including a refusal, which the model then sees itself having made and repeats.
 `--reuse` continues the most recent instead, `--conversation ID` continues a
-specific one. `npm run chat` continues the most recent by default, since that is
-what makes a chat a chat; `--new` starts a clean one.
+specific one.
+
+`npm run chat` continues the most recent by default, since that is what makes a
+chat a chat. `--new` (or `/new` mid-session) **defers**: the next message you
+send becomes the first message of a fresh conversation, so the account's chat
+list shows it titled by real text instead of a placeholder. `/conversations`
+switches between the ones you already have.
 
 Posting to an invented id returns `404 Conversation not found`, and a
 conversation that stops accepting messages (`404` when deleted, `409` when the
@@ -362,7 +384,7 @@ chat. Only the last user message is forwarded.
 npm test
 ```
 
-37 tests, no dependencies, about 2 seconds. `test/harness.mjs` runs the real
+45 tests, no dependencies, a few seconds. `test/harness.mjs` runs the real
 bridge as a subprocess and a scriptable stand-in for the extension, so tests
 drive the actual HTTP surface and the real CLIs rather than mocks of them.
 
@@ -377,6 +399,10 @@ leaving the disk untouched.
 
 To add a case, script the model's replies with `scripted([...])` and, where a
 filter is being modelled, pass `reject` to refuse payloads matching a pattern.
+
+`chat.mjs` carries `// @ts-check` with JSDoc types. It still runs as plain
+`node` with no build and no runtime dependency; to type-check it,
+`npm i -D typescript` once, then `npx tsc -p aipass-bridge/jsconfig.json`.
 
 ## Known limits
 
