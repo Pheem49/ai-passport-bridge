@@ -5,11 +5,13 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const HERE = new URL('.', import.meta.url).pathname;
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const SERVER = path.join(HERE, '..', 'bridge', 'server.mjs');
 export const AGENT = path.join(HERE, '..', 'agent.mjs');
 export const CHAT = path.join(HERE, '..', 'chat.mjs');
+export const DOCTOR = path.join(HERE, '..', 'doctor.mjs');
 
 export function freePort() {
   return new Promise((resolve, reject) => {
@@ -97,10 +99,59 @@ export const createFixture = (requestId, initialMessage) => encodeTurboStream({
   },
 });
 
+// intent=create-temporary-chat answers with the conversation object itself —
+// no conversationId field, the id lives under `id` — and marks it temporary.
+export const temporaryChatFixture = (id = 'M5uhmgOBsPk0v4WN') => encodeTurboStream({
+  data: {
+    conversation: {
+      id,
+      aiAssistantId: null,
+      title: 'New Conversation',
+      modelId: 'gemini-3.1-flash-lite',
+      isTemporary: true,
+      expiresAt: '2027-09-03T04:42:45.870Z',
+      routingMode: 'manual',
+      isPinned: false,
+      createdAt: '2026-09-03T04:42:45.870Z',
+    },
+    error: null,
+  },
+});
+
+// get-usage-quota answers with plain JSON, not turbo-stream. Figures are
+// integers scaled by creditsDecimals, exactly as the real loader sends them.
+export const quotaFixture = ({ limit = '10000000000', used = '167042858', available = '9832957142', decimals = 6 } = {}) =>
+  JSON.stringify({
+    success: true,
+    creditStatusFetchedAt: 1788168532745,
+    creditStatus: {
+      userId: '216052379627656642221',
+      periodEndsAt: '2026-08-31T19:00:00.000Z',
+      creditsDecimals: decimals,
+      credits: { limit, used, available },
+    },
+    videoQuotaStatus: { count: { limit: 10, used: 0, remaining: 10, period: 'month' } },
+  });
+
+// One of each kind the live list contains, plus the ready-but-not-selectable
+// case (openthai2.0-legal@jts is the real one), so the grouping and the
+// filtering are both exercised against shapes the server actually sends.
 const DEFAULT_MODELS = [
-  { id: 'gemini-3.1-flash-lite', displayName: 'Gemini 3.1 Flash Lite', providerName: 'Google', isFreeCredit: true, ready: true },
-  { id: 'claude-sonnet-5@default', displayName: 'Claude Sonnet 5', providerName: 'Anthropic', ready: true },
-  { id: 'veo-3.1-fast-generate-001', displayName: 'Veo 3.1 Fast', providerName: 'Google', ready: true },
+  { id: 'gemini-3.1-flash-lite', displayName: 'Gemini 3.1 Flash Lite', provider: 'google', providerName: 'Google', isFreeCredit: true, ready: true },
+  { id: 'claude-sonnet-5@default', displayName: 'Claude Sonnet 5', provider: 'anthropic', providerName: 'Anthropic', ready: true, thinkingConfig: { supportedLevels: ['low', 'medium', 'high'] } },
+  // Opus is the one model that advertises a fourth level, which is why the
+  // levels have to come from the model rather than a hardcoded list.
+  { id: 'claude-opus-5@azure', displayName: 'Claude Opus 5', provider: 'anthropic', providerName: 'Anthropic', ready: true, thinkingConfig: { supportedLevels: ['low', 'medium', 'high', 'max'] } },
+  { id: 'veo-3.1-fast-generate-001', displayName: 'Veo 3.1 Fast', provider: 'google', providerName: 'Google', ready: true },
+  // The only video model that offers a resolution, which is what makes the
+  // per-model option gate observable.
+  { id: 'seedance-2.0-mini', displayName: 'Seedance 2.0 Mini', provider: 'byteplus', providerName: 'BytePlus', ready: true },
+  { id: 'gpt-image-2', displayName: 'GPT-Image-2', provider: 'openai', providerName: 'OpenAI', ready: true },
+  { id: 'gemini-3-pro-image', displayName: 'Nano Banana Pro', provider: 'google', providerName: 'Google', ready: true },
+  { id: 'lyria-3-pro-preview', displayName: 'Lyria 3 Pro', provider: 'google', providerName: 'Google', ready: true },
+  { id: 'sonar-deep-research', displayName: 'Sonar Deep Research', provider: 'perplexity', providerName: 'Perplexity', ready: true },
+  { id: 'sonar-reasoning-pro', displayName: 'Sonar Reasoning Pro', provider: 'perplexity', providerName: 'Perplexity', ready: true },
+  { id: 'openthai2.0-legal@jts', displayName: 'OpenThai 2.0 Legal', provider: 'openthai', providerName: 'AIEAT', ready: true, selectable: false },
 ];
 const DEFAULT_CONVERSATIONS = [
   { id: 'aaaa1111aaaa1111', title: 'newest', updatedAt: '2026-09-01T10:00:00.000Z' },
@@ -110,13 +161,15 @@ const DEFAULT_CONVERSATIONS = [
 // Stands in for the extension. `onChat` receives the job plus an emitter and
 // decides what the upstream would have streamed back.
 export class FakeExtension {
-  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS } = {}) {
+  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, quota = quotaFixture() } = {}) {
     this.base = base;
+    this.quota = quota;
     this.onChat = onChat ?? (async (_job, e) => { await e.text('ok'); await e.done(); });
     this.models = models;
     this.conversations = conversations;
     this.chats = [];       // every chat job received
     this.created = [];     // every create-conversation job received
+    this.videos = [];      // every video-generation job received
     this.loaders = [];     // every loader url received
   }
 
@@ -177,19 +230,29 @@ export class FakeExtension {
   async #handle(job) {
     if (job.kind === 'create') {
       this.created.push(job);
-      return void this.post('/ext/loader', { jobId: job.jobId, raw: createFixture(job.requestId, job.message) });
+      const raw = job.temporary
+        ? temporaryChatFixture()
+        : createFixture(job.requestId, job.message);
+      return void this.post('/ext/loader', { jobId: job.jobId, raw });
     }
     if (job.kind === 'loader') {
       this.loaders.push(job.url);
-      const raw = job.url.includes('list-conversations')
+      const raw = job.url.includes('get-usage-quota')
+        ? this.quota
+        : job.url.includes('list-conversations')
         ? conversationsFixture(this.conversations)
         : modelsFixture(this.models);
       return void this.post('/ext/loader', { jobId: job.jobId, raw });
     }
+    if (job.kind === 'video') this.videos.push(job);
     this.chats.push(job);
     const emit = {
       text: (t) => this.post('/ext/chunk', { jobId: job.jobId, parts: [{ kind: 'text', text: t }] }),
       status: (t) => this.post('/ext/chunk', { jobId: job.jobId, parts: [{ kind: 'status', text: t }] }),
+      image: (url) => this.post('/ext/chunk', { jobId: job.jobId, parts: [{ kind: 'image', text: url }] }),
+      // Generated media of any kind — the extension routes by media type, so a
+      // video arrives as kind 'video' rather than being called an image.
+      media: (kind, url, filename) => this.post('/ext/chunk', { jobId: job.jobId, parts: [{ kind, text: url, ...(filename ? { filename } : {}) }] }),
       done: (finishReason = 'stop') => this.post('/ext/done', { jobId: job.jobId, finishReason }),
       error: (message) => this.post('/ext/error', { jobId: job.jobId, message }),
     };

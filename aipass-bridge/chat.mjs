@@ -57,8 +57,15 @@ const flag = (name, fallback = null) => {
 
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787') ?? '').replace(/\/+$/, '');
 const CONVERSATION = flag('conversation', null);
+const OUT_DIR = path.resolve(flag('out', process.cwd()) ?? process.cwd());
+const RATIO = flag('ratio', null);
+const RESOLUTION = flag('resolution', null);
+const DURATION = flag('duration', null);
+const STYLE = flag('style', null);
+const CAMERA_FIXED = argv.includes('--camera-fixed');
+const NO_AUDIO = argv.includes('--no-audio');
 const imageArg = flag('image', null);
-const FILES = argv.reduce((acc, a, i) => (a === '--file' && argv[i + 1] ? [...acc, argv[i + 1]] : acc), []);
+const FILES = argv.reduce((/** @type {string[]} */ acc, a, i) => (a === '--file' && argv[i + 1] ? [...acc, argv[i + 1]] : acc), /** @type {string[]} */ ([]));
 let thinkingLevel = flag('thinking', null);
 // `--new` / `/new` don't create a conversation up front — that would seed the
 // account's chat list with a throwaway "New chat." entry. Instead we defer:
@@ -89,6 +96,88 @@ const yellow = sgr(33);
 const cyan = sgr(36);
 const gray = sgr(90);
 
+// An image model answers with a data URI, which is megabytes of base64 — write
+// it out and print where it went, rather than filling the scrollback with it.
+let saved = 0;
+// Extensions for the media types the generators actually return, so a saved
+// file opens by double-clicking it instead of needing to be renamed.
+const EXT = {
+  jpeg: 'jpg', 'svg+xml': 'svg', mpeg: 'mp3', 'x-wav': 'wav', wave: 'wav',
+  quicktime: 'mov', 'x-matroska': 'mkv',
+};
+/** @param {string} mime */
+const extFor = (mime) => {
+  const sub = (mime.split('/')[1] || 'bin').toLowerCase();
+  return (/** @type {Record<string, string>} */ (EXT))[sub] ?? sub.replace(/[^a-z0-9]/g, '');
+};
+
+/**
+ * @param {Buffer} buf
+ * @param {string} mime
+ * @param {string} label
+ */
+const writeMedia = (buf, mime, label) => {
+  const file = path.join(OUT_DIR, `aipass-${Date.now()}-${++saved}.${extFor(mime)}`);
+  fs.writeFileSync(file, buf);
+  return `\n${cyan(`[${label} saved to ${file}]`)}\n`;
+};
+
+// Generated media arrives as markdown: an image tag for pictures, a link for a
+// video or a music clip. Either way the payload is a data: URI to decode, or a
+// URL to go and fetch — a link nobody downloads is not much of a result.
+// The extensions a generator can hand back. A link is only chased when it looks
+// like one of these: a citation in the prose is a link too, and fetching those
+// would be both wrong and slow.
+const MEDIA_EXT = new Set(['mp4', 'webm', 'mov', 'mkv', 'mp3', 'wav', 'ogg', 'm4a', 'flac', 'png', 'jpg', 'jpeg', 'gif', 'webp']);
+
+/**
+ * @param {string} chunk
+ */
+function keepMedia(chunk) {
+  return chunk.replace(/(!?)\[([^\]]*)\]\((data:([^;,)]+)[^)]*|https?:\/\/[^)\s]+)\)/g, (/** @type {string} */ whole, /** @type {string} */ bang, /** @type {string} */ label, /** @type {string} */ target, /** @type {string} */ mime) => {
+    // The label is a filename when the part carried one (video does, music does
+    // not), otherwise a bare kind. Either way what matters is the extension.
+    const labelExt = label.split('.').pop()?.toLowerCase() ?? '';
+    const urlExt = target.split('?')[0].split('.').pop()?.toLowerCase() ?? '';
+    const kind = bang ? 'image' : label.includes('.') ? label : (label || 'file');
+    try {
+      if (target.startsWith('data:')) {
+        const comma = target.indexOf(',');
+        if (comma === -1) return whole;
+        return writeMedia(Buffer.from(target.slice(comma + 1), 'base64'), mime, kind);
+      }
+      if (!bang && !['video', 'audio', 'image', 'file'].includes(label)
+        && !MEDIA_EXT.has(labelExt) && !MEDIA_EXT.has(urlExt)) return whole;
+      pending.push({ url: target, kind });
+      return `\n${cyan(`[${kind} at ${target.split('?')[0]} — downloading]`)}\n`;
+    } catch (/** @type {any} */ err) {
+      return `\n[${kind} could not be saved: ${err.message}]\n`;
+    }
+  });
+}
+
+// Remote media is fetched after the stream closes, so a slow download does not
+// stall the answer still being printed.
+/** @type {Array<{ url: string, kind: string }>} */
+const pending = [];
+async function drainPending() {
+  for (const { url, kind } of pending.splice(0)) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const mime = (res.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim();
+      const buf = Buffer.from(await res.arrayBuffer());
+      stdout.write(writeMedia(buf, mime, kind));
+    } catch (/** @type {any} */ err) {
+      // Generated media is a signed storage URL that anything can fetch, but
+      // only for a few hours. An old link in a resumed conversation is the
+      // likely cause, so say that rather than failing silently.
+      stdout.write(`\n[${kind} could not be downloaded from ${url.split('?')[0]}: ${err.message}]\n` +
+        `[the signed link may have expired — regenerate it]\n`);
+    }
+  }
+}
+
 /** @param {string} s */
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 /** @param {string} s */
@@ -106,6 +195,7 @@ const boxRule = (/** @type {string} */ l, /** @type {string} */ r) =>
 const topRule = () => boxRule('╭', '╮');
 const botRule = () => boxRule('╰', '╯');
 
+/** @param {string} s */
 const stringWidth = (s) => {
   const clean = stripAnsi(s).replace(/[\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]/g, '');
   let w = 0;
@@ -927,11 +1017,11 @@ function attachDocumentFromFile(filePath) {
     }
     const buf = fs.readFileSync(filePath);
     const ext = path.extname(filePath).toLowerCase();
-    const mime = DOC_MIME_MAP[ext] || 'application/octet-stream';
+    const mime = (/** @type {Record<string, string>} */ (DOC_MIME_MAP))[ext] || 'application/octet-stream';
     const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
     const filename = path.basename(filePath);
     return registerDocument(dataUri, filename, filePath, buf.length);
-  } catch (err) {
+  } catch (/** @type {any} */ err) {
     if (TTY) stdout.write('\r\n' + red(`  ✗ cannot read file: ${err.message}`) + '\r\n');
     return null;
   }
@@ -1216,12 +1306,12 @@ async function sayAgent(text, images = []) {
       ]
     : text;
 
-  const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
+  const res = await fetch(`${BRIDGE}/v1/chat/completions`, /** @type {any} */ ({
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: messagesContent }] }),
     ...(currentAbortController ? { signal: currentAbortController.signal } : {}),
-  });
+  }));
   if (!res.ok) throw new Error(`bridge returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
   startSpin();
@@ -1429,9 +1519,9 @@ function agentShowDiff() {
 
 /**
  * @param {string} taskText
- * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null, attachedImages?: Array<{ tag: string, dataUri: string }> }} [opts]
+ * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null, attachedImages?: Array<{ tag: string, dataUri: string }>, attachedDocuments?: AttachedDocument[] }} [opts]
  */
-async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [] } = {}) {
+async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [], attachedDocuments = [] } = {}) {
   // autoApply: null = ask y/N, true = apply automatically, false = dry run
   overlay.clear();
   const prevAllowRun = agentAllowRun;
@@ -1655,17 +1745,23 @@ async function ask(text, attachedImages = [], attachedFiles = []) {
   currentAbortController = new AbortController();
   isGenerating = true;
 
-  const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
+  const res = await fetch(`${BRIDGE}/v1/chat/completions`, /** @type {any} */ ({
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model,
       stream: true,
       messages: [{ role: 'user', content: messagesContent }],
+      ...(RATIO ? { aspect_ratio: RATIO } : {}),
       ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+      ...(RESOLUTION ? { resolution: RESOLUTION } : {}),
+      ...(DURATION ? { duration: Number(DURATION) } : {}),
+      ...(STYLE ? { style_preprompt: STYLE } : {}),
+      ...(CAMERA_FIXED ? { camera_fixed: true } : {}),
+      ...(NO_AUDIO ? { generate_audio: false } : {}),
     }),
     signal: currentAbortController.signal,
-  }).catch((/** @type {unknown} */ err) => {
+  })).catch((/** @type {unknown} */ err) => {
     if (currentAbortController?.signal.aborted || (err instanceof Error && (err.name === 'AbortError' || (/** @type {any} */ (err).cause)?.name === 'AbortError'))) return null;
     console.error(red(`\n✗ cannot reach the bridge: ${err instanceof Error ? err.message : String(err)}`));
     return null;
@@ -1739,7 +1835,7 @@ async function ask(text, attachedImages = [], attachedFiles = []) {
         if (delta.content) {
           stopSpin();
           if (kind === 'tool') out('');      // keep tool blocks and prose apart
-          echo(delta.content);
+          echo(keepMedia(delta.content));
           kind = 'answer';
           wrote = true;
         }
@@ -1750,6 +1846,7 @@ async function ask(text, attachedImages = [], attachedFiles = []) {
     reformat();
     if (!wrote) out(dim('(no reply)'));
     else if (TTY) out(''); // leave the cursor on a fresh line, not mid-spinner-wipe
+    await drainPending();
   } finally {
     stopSpin();
     isGenerating = false;
@@ -1773,7 +1870,7 @@ if (!status.extensions) {
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline && !status?.extensions) {
     await new Promise((r) => setTimeout(r, 100));
-    status = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null);
+    status = /** @type {BridgeStatus | null} */ (await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null));
   }
 }
 if (!status?.extensions) {
@@ -1901,7 +1998,7 @@ const HELP = [
 
 banner();
 
-const rl = readline.createInterface({ input: stdin, output: stdout });
+const rl = /** @type {any} */ (readline.createInterface({ input: stdin, output: stdout }));
 rl.on('SIGINT', () => {
   if (rl.line.length > 0) setLine('');
   handleExit('Ctrl+C');
@@ -1991,6 +2088,7 @@ const hintRule = (/** @type {string} */ sig) => {
   return gray('╰─') + yellow(text) + gray('─'.repeat(rem) + '╯');
 };
 
+/** @param {string} text */
 function renderMessageBox(text) {
   const inner = Math.max(2, termWidth() - 3);
   const maxW = inner - 2;
@@ -2260,7 +2358,7 @@ if (TTY) {
 }
 
 /** @typedef {{ id: string, title?: string, updatedAt?: string }} ConvRow */
-/** @typedef {{ id: string, name?: string, free_credit?: boolean, thinking?: unknown }} ModelRow */
+/** @typedef {{ id: string, name?: string, free_credit?: boolean, thinking?: unknown, kind?: string }} ModelRow */
 
 /**
  * Modal ↑/↓ picker (same interaction as the mockup for /conversations): renders
@@ -2269,7 +2367,7 @@ if (TTY) {
  * restored on exit — so arrows don't leak into history navigation.
  * @template {{ id: string }} T
  * @param {T[]} items
- * @param {{ current: string | null, label: (item: T) => [string, string] }} opts
+ * @param {{ current: string | null, label: (item: T) => [string, string], width?: number }} opts
  *        `label` returns [main text, dim right-hand note] for each row.
  * @returns {Promise<T | null>}
  */
@@ -2420,6 +2518,7 @@ for (;;) {
         current: model,
         label: (m) => {
           const tags = [];
+          if (m.kind && m.kind !== 'chat') tags.push(m.kind);
           if (m.free_credit) tags.push('free');
           if (Array.isArray(m.thinking) && m.thinking.length) tags.push('thinking');
           return [m.id, tags.join(' · ')];

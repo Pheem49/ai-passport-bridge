@@ -9,7 +9,43 @@
   window.__aipassBridgeGen = GEN;
 
   const TAG = '__aipass_bridge';
+  // How often a submitted video job is polled. The web client sits in the same
+  // range; a 4-second clip takes roughly a hundred seconds to render.
+  const POLL_MS = 2000;
+  // What the video job's error codes actually mean.
+  const VIDEO_ERROR_HINTS = {
+    provider_content_policy:
+      "the video provider's safety filter rejected the prompt or image. It is "
+      + 'strict about recognisable real faces, public figures, copyrighted '
+      + 'characters, violence and sensitive subjects; a crowd scene is often '
+      + 'enough. Rewrite the prompt and try again — a rejected job costs no quota',
+    contentPolicyViolation: 'the prompt was rejected by a content filter before it reached the model',
+    quotaExceeded: 'the account has used its video generations for this period — npm run credits shows the count',
+    conflictActive: 'another video job is still running on this conversation',
+  };
   const inflight = new Map();
+  // How many bytes of media may be carried back inline as a data URI; above
+  // this it goes back as a link, since the bridge caps a POST body at 8 MB and
+  // base64 costs a third on top. This only applies to a same-origin URL that
+  // needs this page's cookie: a *generated* image, video or music clip comes
+  // back as a signed storage.googleapis.com link that anything can fetch, and
+  // is passed straight through.
+  const INLINE_CAP = {
+    image: 5 * 1024 * 1024,
+    audio: 25 * 1024 * 1024,
+    video: 50 * 1024 * 1024,
+    file: 10 * 1024 * 1024,
+  };
+
+  // image/png -> image, video/mp4 -> video, audio/wav -> audio. Anything else
+  // is a file, which the bridge renders as a link rather than an image tag.
+  const mediaKind = (mediaType) => {
+    const t = String(mediaType || '').toLowerCase();
+    if (t.startsWith('image/')) return 'image';
+    if (t.startsWith('video/')) return 'video';
+    if (t.startsWith('audio/')) return 'audio';
+    return '';
+  };
 
   const reply = (msg) => window.postMessage({ [TAG]: 'res', ...msg }, window.location.origin);
 
@@ -144,9 +180,9 @@
       buffer = [];
     };
     const ticker = setInterval(flush, 40);
-    const push = (kind, text) => {
+    const push = (kind, text, filename) => {
       if (!text) return;
-      buffer.push({ kind, text });
+      buffer.push({ kind, text, ...(filename ? { filename } : {}) });
       if (buffer.length >= 10) flush();
     };
 
@@ -198,7 +234,7 @@
 
       const body = JSON.stringify({
         modelId: job.modelId,
-        imageAspectRatio: '1:1',
+        imageAspectRatio: job.aspectRatio || '1:1',
         ...(job.temporary ? { isTemporary: true } : {}),
         ...(job.thinkingLevel ? { thinkingLevel: job.thinkingLevel } : {}),
         messages: [{
@@ -283,6 +319,54 @@
               push('status', `[${name}] returned ${size} chars`);
               break;
             }
+            // Generated media — an image, a video, a music clip — all arrive as
+            // a file part. Its URL is usually same-origin and needs the session
+            // cookie, which only this page has, so it is fetched here and handed
+            // back as a data URI. Anything already absolute, or too big to
+            // carry, goes back as a plain URL instead.
+            case 'file': {
+              const d = evt.data ?? {};
+              // Music comes back with `url`; video has no `url` at all, only
+              // `snapshotUrl` beside `storageKey` and `filename`. Reading just
+              // `url` dropped every generated video on the floor.
+              const url = evt.url ?? evt.snapshotUrl ?? d.url ?? d.snapshotUrl ?? '';
+              if (!url) break;
+              const mediaType = evt.mediaType ?? d.mediaType ?? '';
+              const filename = evt.filename ?? d.filename ?? '';
+              // The kind decides how the client renders it: an mp4 in an image
+              // tag is a broken image, not a video.
+              const kind = mediaKind(mediaType) || (/^data:/i.test(url) ? mediaKind(url.slice(5)) : '') || 'file';
+              if (/^data:/i.test(url)) { push(kind, url, filename); break; }
+              // Say what arrived before any fetching. A generation takes about a
+              // minute, and this is the first sign the caller gets that it
+              // produced something.
+              push('status', `[${kind}] ${mediaType || 'unknown type'}`);
+              let carried = '';
+              if (!/^https?:\/\//i.test(url) || url.startsWith(location.origin)) {
+                try {
+                  const r = await fetch(url, { credentials: 'include', signal: controller.signal });
+                  const blob = await r.blob();
+                  const cap = INLINE_CAP[kind] ?? INLINE_CAP.file;
+                  push('status', `[${kind}] ${(blob.size / 1048576).toFixed(2)} MB`);
+                  if (blob.size <= cap) {
+                    carried = await new Promise((resolve, reject) => {
+                      const fr = new FileReader();
+                      fr.onload = () => resolve(String(fr.result));
+                      fr.onerror = () => reject(fr.error);
+                      fr.readAsDataURL(blob);
+                    });
+                  } else {
+                    // This branch is same-origin only, so the link it falls back
+                    // to does need the session cookie. Say so.
+                    push('status', `[${kind}] over the ${(cap / 1048576).toFixed(0)} MB inline limit — sending the link, which needs a logged-in browser`);
+                  }
+                } catch (err) {
+                  push('status', `[${kind}] could not read it here (${err?.message ?? err}), sending the link`);
+                }
+              }
+              push(kind, carried || new URL(url, location.origin).href, filename);
+              break;
+            }
             case 'source-url':
               if (evt.url && !sources.some((x) => x.url === evt.url)) sources.push({ url: evt.url, title: evt.title });
               break;
@@ -312,13 +396,118 @@
     }
   }
 
+  // Video is a different protocol from everything else here. Chat, images and
+  // music stream back from /actions/send-message; video is submitted as a job
+  // to /actions/video-generation, then polled until it reports completed. The
+  // web client does exactly this, and there is no streaming variant of it.
+  async function runVideo(job) {
+    const controller = new AbortController();
+    inflight.set(job.jobId, controller);
+    const buffer = [];
+    const push = (kind, text, filename) => { if (text) buffer.push({ kind, text, ...(filename ? { filename } : {}) }); };
+    const flush = () => { if (buffer.length) { reply({ jobId: job.jobId, kind: 'chunk', parts: buffer.splice(0) }); } };
+    let jobId = '';
+    try {
+      const body = {
+        conversationId: job.conversationId,
+        prompt: job.text,
+        provider: job.provider,
+        modelId: job.modelId,
+        // Only what the caller actually set. The app omits each of these the
+        // same way rather than sending a default of its own.
+        ...(job.aspectRatio ? { aspectRatio: job.aspectRatio } : {}),
+        ...(job.stylePreprompt ? { stylePreprompt: job.stylePreprompt } : {}),
+        ...(job.resolution ? { resolution: job.resolution } : {}),
+        ...(job.duration !== undefined ? { duration: job.duration } : {}),
+        ...(job.cameraFixed !== undefined ? { cameraFixed: job.cameraFixed } : {}),
+        ...(job.generateAudio !== undefined ? { generateAudio: job.generateAudio } : {}),
+      };
+      const res = await fetch('/actions/video-generation', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const detail = (await res.text().catch(() => '')).slice(0, 500);
+        // The route validates the body as a whole and says only "Invalid
+        // request body", so name the fields that were sent — the offender is
+        // one of them, and otherwise there is nothing to go on.
+        const sent = Object.entries(body)
+          .filter(([k]) => k !== 'prompt')
+          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+          .join(' ');
+        throw new Error(`video-generation returned ${res.status}: ${detail} — sent ${sent}`);
+      }
+      const started = await res.json();
+      if (started?.error) throw new Error(String(started.error));
+      jobId = started?.jobId;
+      if (!jobId) throw new Error('video-generation returned no jobId');
+      // The model can be switched server-side when the requested one is busy.
+      if (started.autoSwitched && started.modelId) {
+        push('status', `[video] switched to ${started.modelId}`);
+      }
+      push('status', `[video] job ${jobId} accepted`);
+      flush();
+
+      const url = `/actions/video-generation?conversationId=${encodeURIComponent(job.conversationId)}&jobId=${encodeURIComponent(jobId)}`;
+      let lastProgress = -1;
+      for (;;) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        if (controller.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        const poll = await fetch(url, { credentials: 'include', signal: controller.signal });
+        if (!poll.ok) throw new Error(`polling returned ${poll.status}`);
+        const state = await poll.json();
+        // Progress is not monotonic and can be absent; only say something when
+        // it actually moves, or the caller gets a status line every two seconds.
+        if (typeof state.progress === 'number' && state.progress !== lastProgress) {
+          lastProgress = state.progress;
+          push('status', `[video] ${state.progress}%`);
+          flush();
+        }
+        if (state.status === 'completed') {
+          const videoUrl = state.videoUrl ?? state.url;
+          if (!videoUrl) throw new Error('the job completed without a video url');
+          push('video', videoUrl, `${jobId}.mp4`);
+          flush();
+          reply({ jobId: job.jobId, kind: 'done', finishReason: 'stop' });
+          return;
+        }
+        if (state.status === 'failed' || state.error) {
+          const code = String(state.error ?? 'video generation failed');
+          // The codes are terse and the web UI expands them in Thai. A caller in
+          // a terminal gets neither, so the actionable part is spelled out here.
+          throw new Error(`${code}${VIDEO_ERROR_HINTS[code] ? ` — ${VIDEO_ERROR_HINTS[code]}` : ''}`);
+        }
+      }
+    } catch (err) {
+      // A job left running keeps burning the account's video quota, so cancel
+      // it on the way out rather than abandoning it.
+      if (jobId) {
+        fetch('/actions/video-generation', {
+          method: 'POST', credentials: 'include',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ _action: 'cancel', conversationId: job.conversationId, jobId }),
+        }).then((r) => r.body?.cancel()).catch(() => {});
+      }
+      if (err?.name === 'AbortError') reply({ jobId: job.jobId, kind: 'done', finishReason: 'stop' });
+      else reply({ jobId: job.jobId, kind: 'error', message: String(err?.message ?? err) });
+    } finally {
+      inflight.delete(job.jobId);
+    }
+  }
+
   window.addEventListener('message', (event) => {
     if (window.__aipassBridgeGen !== GEN) return; // superseded by a newer injection
     if (event.source !== window) return;
     const msg = event.data;
     if (!msg || typeof msg !== 'object') return;
     if (msg[TAG] === 'req') {
-      const fn = msg.job.kind === 'loader' ? runLoader : msg.job.kind === 'create' ? runCreate : run;
+      const fn = msg.job.kind === 'loader' ? runLoader
+        : msg.job.kind === 'create' ? runCreate
+        : msg.job.kind === 'video' ? runVideo
+        : run;
       fn(msg.job);
     }
     else if (msg[TAG] === 'abort') inflight.get(msg.jobId)?.abort();

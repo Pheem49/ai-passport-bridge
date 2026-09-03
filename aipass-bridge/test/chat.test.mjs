@@ -1,7 +1,9 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
-import { startBridge, FakeExtension, scripted, run, CHAT } from './harness.mjs';
+import { startBridge, FakeExtension, scripted, run, tempDir, waitFor, CHAT } from './harness.mjs';
 
 let bridge;
 before(async () => { bridge = await startBridge(); });
@@ -156,4 +158,93 @@ test('forwards thinking level when --thinking is provided', async (t) => {
   assert.equal(code, 0);
   assert.match(out, /Reasoned answer/);
   assert.equal(receivedThinking, 'high');
+});
+
+test('a generated video is decoded to disk, not left as a data URI', async (t) => {
+  const mp4 = Buffer.from('AAAAIGZ0eXBpc29t', 'base64');
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (_j, e) => { await e.media('video', `data:video/mp4;base64,${mp4.toString('base64')}`); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const dir = tempDir({});
+  const { out } = await chat(['a cat', '--model', 'veo-3.1-fast-generate-001', '--out', dir]);
+  assert.match(out, /video\.mp4 saved to/);
+  const written = fs.readdirSync(dir).filter((f) => f.endsWith('.mp4'));
+  assert.equal(written.length, 1, 'the extension must come from the media type');
+  assert.deepEqual(fs.readFileSync(path.join(dir, written[0])), mp4);
+});
+
+test('a video delivered as a link is downloaded once the answer is printed', async (t) => {
+  const body = Buffer.from('fake mp4 bytes');
+  const origin = await new Promise((resolve) => {
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'video/mp4' });
+      res.end(body);
+    });
+    srv.listen(0, '127.0.0.1', () => resolve({ url: `http://127.0.0.1:${srv.address().port}/clip.mp4`, srv }));
+  });
+  t.after(() => origin.srv.close());
+
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (_j, e) => { await e.media('video', origin.url); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const dir = tempDir({});
+  const { out } = await chat(['a cat', '--model', 'veo-3.1-fast-generate-001', '--out', dir]);
+  assert.match(out, /downloading/);
+  assert.match(out, /saved to/);
+  const written = fs.readdirSync(dir).filter((f) => f.endsWith('.mp4'));
+  assert.deepEqual(fs.readFileSync(path.join(dir, written[0])), body);
+});
+
+test('an unreachable link says why instead of failing silently', async (t) => {
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (_j, e) => { await e.media('video', 'http://127.0.0.1:1/private.mp4'); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out } = await chat(['a cat', '--model', 'veo-3.1-fast-generate-001', '--out', tempDir({})]);
+  assert.match(out, /could not be downloaded/);
+  assert.match(out, /signed link may have expired/);
+});
+
+test('a video link labelled with a filename is still downloaded', async (t) => {
+  const body = Buffer.from('fake mp4');
+  const origin = await new Promise((resolve) => {
+    const srv = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'video/mp4' });
+      res.end(body);
+    });
+    srv.listen(0, '127.0.0.1', () => resolve({ url: `http://127.0.0.1:${srv.address().port}/01a065f9.mp4?X-Goog-Signature=abc`, srv }));
+  });
+  t.after(() => origin.srv.close());
+
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (_j, e) => { await e.media('video', origin.url, '01a065f9-b680-70ee-9b8b-9af350dd4fd7.mp4'); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const dir = tempDir({});
+  const { out } = await chat(['a street', '--model', 'seedance-2.0-mini', '--out', dir]);
+  assert.match(out, /downloading/, 'a uuid filename must not stop the link being chased');
+  assert.ok(!out.includes('X-Goog-Signature'), 'the signature is noise in the terminal');
+  const written = fs.readdirSync(dir).filter((f) => f.endsWith('.mp4'));
+  assert.deepEqual(fs.readFileSync(path.join(dir, written[0])), body);
+});
+
+test('--resolution and the video switches reach the job', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/v1/models?refresh=1`)).json()).data.length > 1);
+
+  await chat(['a street', '--model', 'seedance-2.0-mini', '--resolution', '720p',
+    '--duration', '8', '--camera-fixed', '--no-audio', '--style', 'Documentary style.']);
+  const job = ext.videos.at(-1);
+  assert.equal(job.resolution, '720p');
+  assert.equal(job.duration, 8);
+  assert.equal(job.cameraFixed, true);
+  assert.equal(job.generateAudio, false);
+  assert.equal(job.stylePreprompt, 'Documentary style.');
 });
