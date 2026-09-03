@@ -13,6 +13,29 @@ let connected = false;
 let lastError = '';
 const jobTabs = new Map();
 
+let offscreenSetup = null;
+function ensureOffscreenDocument() {
+  if (typeof chrome.offscreen === 'undefined') return Promise.resolve();
+  if (offscreenSetup) return offscreenSetup;
+  offscreenSetup = (async () => {
+    try {
+      if (await chrome.offscreen.hasDocument?.()) return;
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Holds a port open so the service worker survives while no aipass tab is open',
+      });
+    } catch (err) {
+      if (!/single offscreen document/i.test(String(err?.message ?? err))) {
+        console.warn('[aipass-bg] offscreen document:', err);
+      }
+    } finally {
+      offscreenSetup = null;
+    }
+  })();
+  return offscreenSetup;
+}
+
 const bridgeUrl = async () => {
   try {
     const res = await chrome.storage.local.get('bridgeUrl');
@@ -127,6 +150,8 @@ async function connect() {
   controller = new AbortController();
   const signal = controller.signal;
 
+  ensureOffscreenDocument();
+
   try {
     const res = await fetch(`${await bridgeUrl()}/ext/events`, {
       headers: { accept: 'text/event-stream' },
@@ -169,14 +194,18 @@ async function connect() {
   }
 }
 
-// A content script holds this port open so Chrome does not evict the worker.
+// A content script and the offscreen document each hold one of these open, which
+// is what stops Chrome evicting the worker.
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'keepalive') return;
-  if (!connected) connect(); // a de.aipass.net tab just appeared (or the worker just woke)
+  if (port.name !== 'keepalive' && port.name !== 'offscreen-keepalive') return;
+  if (!connected) connect();
   port.onMessage.addListener(() => {
     if (!connected) connect();
   });
-  port.onDisconnect.addListener(() => { void chrome.runtime.lastError; });
+  port.onDisconnect.addListener(() => {
+    void chrome.runtime.lastError;
+    if (port.name === 'offscreen-keepalive') ensureOffscreenDocument();
+  });
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -213,10 +242,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'reconnect') { controller?.abort(); connect(); sendResponse({ ok: true }); return true; }
 });
 
-// The worker can be evicted at any time; the alarm brings it back and the
-// connect() guard makes a duplicate call harmless.
+// Periodic alarm to ensure worker and offscreen document stay active
 chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(() => { if (!connected) connect(); });
-chrome.runtime.onStartup.addListener(() => { if (!connected) connect(); });
-chrome.runtime.onInstalled.addListener(() => { if (!connected) connect(); });
+chrome.alarms.onAlarm.addListener(() => {
+  ensureOffscreenDocument();
+  if (!connected) connect();
+});
+chrome.runtime.onStartup.addListener(() => {
+  ensureOffscreenDocument();
+  if (!connected) connect();
+});
+chrome.runtime.onInstalled.addListener(() => {
+  ensureOffscreenDocument();
+  if (!connected) connect();
+});
+ensureOffscreenDocument();
 connect();

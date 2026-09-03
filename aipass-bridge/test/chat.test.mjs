@@ -115,3 +115,45 @@ test('handles aborted stream without crashing', async (t) => {
   assert.equal(code, 0);
   assert.match(out, /First chunk/);
 });
+
+test('sends document part when --file is provided', async (t) => {
+  /** @type {any} */
+  let receivedParts = null;
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => {
+      receivedParts = job.parts;
+      await e.text('Analyzed document');
+      await e.done();
+    },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const docPath = path.resolve(import.meta.dirname, '../README.md');
+  const { out, code } = await chat(['summarise this readme', '--file', docPath]);
+  assert.equal(code, 0);
+  assert.match(out, /Analyzed document/);
+  assert.ok(receivedParts, 'bridge should receive parts');
+  const filePart = receivedParts.find((/** @type {any} */ p) => p.type === 'file');
+  assert.ok(filePart, 'parts should contain a file part');
+  assert.equal(filePart.filename, 'README.md');
+  assert.equal(filePart.mediaType, 'text/markdown');
+  assert.match(filePart.data, /^data:text\/markdown;base64,/);
+});
+
+test('forwards thinking level when --thinking is provided', async (t) => {
+  /** @type {any} */
+  let receivedThinking = null;
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => {
+      receivedThinking = job.thinkingLevel;
+      await e.text('Reasoned answer');
+      await e.done();
+    },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out, code } = await chat(['deep thought', '--thinking', 'high']);
+  assert.equal(code, 0);
+  assert.match(out, /Reasoned answer/);
+  assert.equal(receivedThinking, 'high');
+});

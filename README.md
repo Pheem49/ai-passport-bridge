@@ -5,7 +5,7 @@
 <p align="left">
   <img src="https://img.shields.io/badge/node-%E2%89%A518-blue?logo=node.js&style=flat-square" alt="Node >= 18" />
   <img src="https://img.shields.io/badge/dependencies-zero-success?style=flat-square" alt="Zero Dependencies" />
-  <img src="https://img.shields.io/badge/tests-49%20passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-50%20passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgray?style=flat-square" alt="Platforms" />
 </p>
 
@@ -19,7 +19,7 @@
 terminal / CLI ──HTTP──▶ bridge (node, zero dependencies)
                              │  SSE: jobs out, POST: deltas back
                              ▼
-                          extension service worker (MV3)
+                          extension service worker (MV3) + Offscreen Keepalive
                              │  chrome.runtime
                              ▼
                           de.aipass.net tab ──▶ /actions/send-message/<id>
@@ -40,10 +40,18 @@ terminal / CLI ──HTTP──▶ bridge (node, zero dependencies)
   - Interactive slash-command menu (`/`) with 5-item pagination, navigation header (`Suggestions (1/13)`), and arrow-key browsing.
   - Bracketed paste mode (pasted multiline text won't accidentally auto-submit).
   - Native Unicode & Thai tone mark width alignment.
+  - 📄 **Document & File Attachments (`[file1]`):**
+    - Attach documents via `--file <path>` (repeatable, up to 20 MB).
+    - Supported formats: PDF (`.pdf`), Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), Text (`.txt`, `.md`, `.csv`, `.json`).
+    - In-chat slash command `/file <path> [prompt]` or auto-detection when pasting document paths.
   - 🖼️ **Multimodal Image Support (`[image1]`):**
     - Paste images directly from OS clipboard using `Alt+V` (or `Ctrl+V`).
     - Drag-and-drop or paste image paths (`.png`, `.jpg`, `.webp`) — automatically converts to `[image1]`.
     - Slash commands `/clip [prompt]` and `/image <path> [prompt]` for instant attachment.
+  - 🧠 **Reasoning Thinking Level (`--thinking` / `/thinking`):**
+    - Select thinking depth (`low`, `medium`, `high`, `max`) on reasoning models like Claude 3.7 and Gemini.
+  - 🛡️ **Chrome MV3 Offscreen Keepalive:**
+    - Dedicated offscreen document ensures the background service worker never sleeps during long tasks.
 
 - 🤖 **Autonomous Coding Agent (`/agent` or `aipass agent`):**
   - Runs in **Chat Mode** or **Agent Mode** directly within the TUI, or as a standalone CLI.
@@ -139,10 +147,12 @@ While in the interactive `aipass` chat, type `/` to open the interactive command
 |---|---|
 | `/agent` | Toggle between **Chat Mode** and **Autonomous Agent Mode** (or run a single agent task) |
 | `/agent-root <dir>` | Change the target directory the agent operates on |
+| `/file <path> [prompt]` | Attach a document (PDF, Word, Excel, CSV, text) with optional prompt |
 | `/clip [prompt]` | Paste image from OS clipboard with optional prompt (shortcut: `Alt+V`) |
 | `/image <path> [prompt]` | Attach local image file with optional prompt |
 | `/model` | Open an interactive arrow-key selector to switch AI models |
 | `/models` | Print the full list of available models |
+| `/thinking` | Open an interactive arrow-key selector to set reasoning thinking level (or `/thinking <level>`) |
 | `/conversations` | Open an arrow-key selector to switch between past conversations |
 | `/new` | Start a fresh conversation with the next message sent |
 | `/clear` | Clear the terminal screen |
@@ -220,7 +230,7 @@ This monorepo contains two components:
 │   ├── extension/           # Chrome Manifest V3 extension
 │   ├── chat.mjs             # Interactive TUI chat client
 │   ├── agent.mjs            # Autonomous coding agent loop
-│   ├── test/                # Test suite (49 native Node.js tests)
+│   ├── test/                # Test suite (50 native Node.js tests)
 │   ├── README.md            # Detailed bridge documentation
 │   └── DOCS.md              # In-depth architectural internals
 │
@@ -245,7 +255,7 @@ This monorepo contains two components:
 
 ## 🧪 Testing
 
-Run the comprehensive test suite (49 integration and unit tests covering WAF evasion, streaming, tools, pagination, and CLI edge cases):
+Run the comprehensive test suite (50 integration and unit tests covering WAF evasion, streaming, tools, pagination, and CLI edge cases):
 
 ```bash
 npm test

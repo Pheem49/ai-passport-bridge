@@ -157,20 +157,18 @@
         for (const p of job.parts) {
           if (p.type === 'image' || p.type === 'file') {
             const rawUrl = p.image || p.url || p.data || '';
-            let mediaType = p.mediaType || 'image/jpeg';
+            let mediaType = p.mediaType || (p.type === 'image' ? 'image/jpeg' : 'application/octet-stream');
             let blob = null;
             // Only data: URIs are accepted here. The bridge resolves remote
-            // image URLs to data URIs server-side (behind an SSRF guard), so the
-            // extension is never asked to fetch an arbitrary URL with the user's
-            // cookies.
+            // URLs to data URIs server-side (behind an SSRF guard).
             if (rawUrl.startsWith('data:')) {
               blob = dataUrlToBlob(rawUrl);
               mediaType = blob.type || mediaType;
             }
             if (blob) {
               const ext = (mediaType.split('/')[1] || 'jpeg').replace(/^jpeg$/, 'jpg');
-              const filename = p.filename || `image.${ext}`;
-              push('status', `[upload] uploading image (${(blob.size / 1024).toFixed(1)} KB)...`);
+              const filename = p.filename || `${p.type === 'image' ? 'image' : 'attachment'}.${ext}`;
+              push('status', `[upload] uploading ${filename} (${(blob.size / 1024).toFixed(1)} KB)...`);
               const uploadRes = await uploadFileHelper(
                 blob,
                 filename,
@@ -201,6 +199,8 @@
       const body = JSON.stringify({
         modelId: job.modelId,
         imageAspectRatio: '1:1',
+        ...(job.temporary ? { isTemporary: true } : {}),
+        ...(job.thinkingLevel ? { thinkingLevel: job.thinkingLevel } : {}),
         messages: [{
           id: crypto.randomUUID(),
           role: 'user',

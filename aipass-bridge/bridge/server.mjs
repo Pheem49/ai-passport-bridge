@@ -128,7 +128,7 @@ const sendToClient = (client, event, data) =>
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 class Job {
-  constructor({ kind = 'chat', modelId, text, parts, conversationId, url, message, requestId, assistant, assistantField, timeoutMs, onDelta, onDone, onError }) {
+  constructor({ kind = 'chat', modelId, text, parts, conversationId, url, message, requestId, assistant, assistantField, temporary = false, thinkingLevel, timeoutMs, onDelta, onDone, onError }) {
     this.id = randomUUID();
     this.kind = kind;
     this.url = url;
@@ -136,6 +136,8 @@ class Job {
     this.requestId = requestId;
     this.assistant = assistant;
     this.assistantField = assistantField;
+    this.temporary = temporary;
+    this.thinkingLevel = thinkingLevel;
     this.timeoutMs = timeoutMs ?? IDLE_TIMEOUT_MS;
     this.modelId = modelId;
     this.text = text;
@@ -161,7 +163,16 @@ class Job {
       ? { jobId: this.id, kind: 'loader', url: this.url }
       : this.kind === 'create'
       ? { jobId: this.id, kind: 'create', modelId: this.modelId, message: this.message, requestId: this.requestId, assistant: this.assistant, assistantField: this.assistantField }
-      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text, parts: this.parts });
+      : {
+          jobId: this.id,
+          kind: 'chat',
+          conversationId: this.conversationId,
+          modelId: this.modelId,
+          text: this.text,
+          parts: this.parts,
+          ...(this.temporary ? { temporary: true } : {}),
+          ...(this.thinkingLevel ? { thinkingLevel: this.thinkingLevel } : {}),
+        });
   }
   delta(part) { if (!this.settled) { this.touch(); this.onDelta(part); } }
   done(value) { if (this.settled) return; this.cleanup(); this.onDone(value ?? 'stop'); }
@@ -190,6 +201,14 @@ const cachedModels = () =>
   modelCache.models.length
     ? modelCache.models
     : MODELS_FALLBACK.map((id) => ({ id, name: id, provider: null, free: false, ready: true, thinking: null }));
+
+// The thinking level a model will actually accept, or undefined. Falls back to
+// the common three when the model list has not been fetched yet.
+function thinkingLevelFor(modelId, level) {
+  const known = cachedModels().find((m) => m.id === modelId)?.thinking;
+  const allowed = Array.isArray(known) && known.length ? known : ['low', 'medium', 'high'];
+  return allowed.includes(level) ? level : undefined;
+}
 
 async function listModels({ force = false } = {}) {
   if (!force && modelCache.models.length && Date.now() - modelCache.at < MODEL_TTL_MS) return modelCache.models;
@@ -288,7 +307,7 @@ async function resolveConversation() {
 
 // A 404 means the conversation was deleted; a 409 means the server still
 // believes a generation is running there. Neither recovers on its own.
-function startChat({ modelId, text, parts, onDelta, onDone, onError }) {
+function startChat({ modelId, text, parts, temporary = false, thinkingLevel, onDelta, onDone, onError }) {
   let attempts = 0;
   let delivered = 0;
   let current = null;
@@ -300,7 +319,7 @@ function startChat({ modelId, text, parts, onDelta, onDone, onError }) {
     catch (err) { return onError(err.message); }
 
     current = new Job({
-      modelId, text, parts, conversationId,
+      modelId, text, parts, conversationId, temporary, thinkingLevel,
       onDelta: (part) => { delivered++; onDelta(part); },
       onDone,
       onError: (message) => {
@@ -322,8 +341,28 @@ function startChat({ modelId, text, parts, onDelta, onDone, onError }) {
   return { abort: () => current?.abort() };
 }
 
-// Fetch remote image and convert to Base64 Data URI with SSRF guard
-async function fetchRemoteImageAsDataUri(urlStr) {
+// What may be attached to a message. Images go to vision models; the document
+// types are what the web UI's own file picker offers.
+const DOCUMENT_TYPES = new Set([
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/json',
+]);
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+const isAllowedAttachment = (type, kind) =>
+  kind === 'image' ? type.startsWith('image/') : type.startsWith('image/') || DOCUMENT_TYPES.has(type);
+
+// Fetch a remote attachment and convert it to a Base64 data URI, with SSRF guard.
+async function fetchRemoteAsDataUri(urlStr, kind = 'image') {
   const parsed = new URL(urlStr);
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     throw new Error(`unsupported protocol: ${parsed.protocol}`);
@@ -337,20 +376,39 @@ async function fetchRemoteImageAsDataUri(urlStr) {
     signal: AbortSignal.timeout(15_000),
     headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
   });
-  if (!res.ok) throw new Error(`remote image fetch failed with status ${res.status}`);
+  if (!res.ok) throw new Error(`remote fetch failed with status ${res.status}`);
   const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
-  if (!contentType.startsWith('image/')) {
-    throw new Error(`expected image content-type, got ${contentType}`);
+  if (!isAllowedAttachment(contentType, kind)) {
+    throw new Error(`unsupported content-type: ${contentType}`);
   }
   const arrayBuffer = await res.arrayBuffer();
-  if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
-    throw new Error(`image size too large: ${arrayBuffer.byteLength} bytes`);
+  if (arrayBuffer.byteLength > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`attachment too large: ${arrayBuffer.byteLength} bytes`);
   }
   const base64 = Buffer.from(arrayBuffer).toString('base64');
   return `data:${contentType};base64,${base64}`;
 }
 
-// Extract multimodal parts (text and images) from OpenAI formatted messages
+const dataUriType = (s) => (s.match(/^data:([^;,]+)/)?.[1] || '').toLowerCase();
+
+function defaultFilename(mediaType) {
+  const ext = ({
+    'application/pdf': 'pdf',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.ms-excel': 'xls',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.ms-powerpoint': 'ppt',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+    'text/csv': 'csv',
+    'application/json': 'json',
+  })[mediaType] || (mediaType.split('/')[1] || 'bin').replace(/^jpeg$/, 'jpg');
+  return `attachment.${ext}`;
+}
+
+// Extract multimodal parts (text, images, files) from OpenAI formatted messages
 async function extractUserParts(messages) {
   const lastUser = (messages ?? []).filter((m) => m.role === 'user').at(-1);
   if (!lastUser) return { text: '', parts: [] };
@@ -376,8 +434,8 @@ async function extractUserParts(messages) {
           textPieces.push(t);
           parts.push({ type: 'text', text: t });
         }
-      } else if (item.type === 'image_url') {
-        const rawUrl = item.image_url?.url || item.url || (typeof item.image === 'string' ? item.image : null);
+      } else if (item.type === 'image_url' || item.type === 'image') {
+        const rawUrl = item.image_url?.url || item.url || item.image || item.data || null;
         if (typeof rawUrl === 'string' && rawUrl.trim()) {
           const urlStr = rawUrl.trim();
           let dataUri = '';
@@ -385,7 +443,7 @@ async function extractUserParts(messages) {
             dataUri = urlStr;
           } else if (/^https?:\/\//i.test(urlStr)) {
             try {
-              dataUri = await fetchRemoteImageAsDataUri(urlStr);
+              dataUri = await fetchRemoteAsDataUri(urlStr, 'image');
             } catch (err) {
               log(`warning: failed to fetch remote image ${urlStr}: ${err.message}`);
             }
@@ -397,20 +455,43 @@ async function extractUserParts(messages) {
             });
           }
         }
-      } else if (item.type === 'image' || item.type === 'file') {
-        const raw = item.image || item.url || item.data || '';
+      } else if (item.type === 'file') {
+        const raw = item.file?.file_data || item.file?.url || item.url || item.data || '';
         if (typeof raw === 'string' && raw.trim()) {
-          parts.push({
-            type: 'image',
-            image: raw.trim()
-          });
+          const str = raw.trim();
+          let dataUri = '';
+          if (str.startsWith('data:')) {
+            const declared = dataUriType(str);
+            if (isAllowedAttachment(declared, 'file')) dataUri = str;
+            else log(`warning: refusing attachment of type ${declared || 'unknown'}`);
+          } else if (/^https?:\/\//i.test(str)) {
+            try {
+              dataUri = await fetchRemoteAsDataUri(str, 'file');
+            } catch (err) {
+              log(`warning: failed to fetch remote file ${str}: ${err.message}`);
+            }
+          }
+          if (dataUri) {
+            const mediaType = dataUriType(dataUri) || 'application/octet-stream';
+            if (mediaType.startsWith('image/')) {
+              parts.push({ type: 'image', image: dataUri });
+            } else {
+              parts.push({
+                type: 'file',
+                mediaType,
+                filename: item.file?.filename || item.filename || defaultFilename(mediaType),
+                data: dataUri,
+              });
+            }
+          }
         }
       }
     }
 
+    const named = parts.find((p) => p.type === 'file')?.filename;
     const text = textPieces.join('\n').trim();
     return {
-      text: text || (parts.length ? '[Image]' : ''),
+      text: text || (named ? `[${named}]` : parts.length ? '[Image]' : ''),
       parts: parts.length ? parts : (text ? [{ type: 'text', text }] : [])
     };
   }
@@ -455,13 +536,19 @@ async function chatCompletions(req, res) {
   catch { return oaiError(res, 400, 'invalid JSON body'); }
 
   const model = String(payload.model ?? defaultModel).replace(/^aipass\//, '');
+  const thinking = String(payload.thinking_level ?? payload.thinkingLevel ?? '').trim().toLowerCase();
+  const thinkingLevel = thinking ? thinkingLevelFor(model, thinking) : undefined;
+  if (thinking && !thinkingLevel) log(`warning: ${model} does not offer thinking level ${thinking}`);
+  const temporary = Boolean(payload.temporary);
+
   const { text, parts } = await extractUserParts(payload.messages);
   if (!text && (!parts || parts.length === 0)) return oaiError(res, 400, 'no user message');
 
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
   const imageCount = (parts ?? []).filter(p => p.type === 'image').length;
-  log(`chat -> ${model} (${Buffer.byteLength(text)} bytes text${imageCount ? `, ${imageCount} image(s)` : ''})`);
+  const fileCount = (parts ?? []).filter(p => p.type === 'file').length;
+  log(`chat -> ${model} (${Buffer.byteLength(text)} bytes text${imageCount ? `, ${imageCount} image(s)` : ''}${fileCount ? `, ${fileCount} file(s)` : ''}${thinkingLevel ? `, thinking: ${thinkingLevel}` : ''})`);
 
   if (payload.stream) {
     res.writeHead(200, {
@@ -480,7 +567,7 @@ async function chatCompletions(req, res) {
     emit({ role: 'assistant', content: '' });
 
     const job = startChat({
-      modelId: model, text, parts,
+      modelId: model, text, parts, temporary, thinkingLevel,
       onDelta: (part) => {
         if (part.kind === 'status') {
           if (TOOL_VISIBILITY === 'off') return;
@@ -510,7 +597,7 @@ async function chatCompletions(req, res) {
   let reasoning = '';
   await new Promise((resolve) => {
     const job = startChat({
-      modelId: model, text, parts,
+      modelId: model, text, parts, temporary, thinkingLevel,
       onDelta: (p) => {
         if (p.kind === 'status') { if (TOOL_VISIBILITY !== 'off') reasoning += `${p.text}\n`; return; }
         if (p.kind === 'reasoning') reasoning += p.text;

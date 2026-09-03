@@ -58,6 +58,8 @@ const flag = (name, fallback = null) => {
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787') ?? '').replace(/\/+$/, '');
 const CONVERSATION = flag('conversation', null);
 const imageArg = flag('image', null);
+const FILES = argv.reduce((acc, a, i) => (a === '--file' && argv[i + 1] ? [...acc, argv[i + 1]] : acc), []);
+let thinkingLevel = flag('thinking', null);
 // `--new` / `/new` don't create a conversation up front — that would seed the
 // account's chat list with a throwaway "New chat." entry. Instead we defer:
 // the next message the user actually sends becomes the seed, so the entry is
@@ -799,9 +801,27 @@ function agentParse(reply) {
   return calls;
 }
 
-/* ---------------------------------------------------- multimodal / image attach */
+/* ---------------------------------------------------- multimodal / image & document attach */
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+const DOCUMENT_EXTS = new Set([
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.txt', '.md', '.csv', '.json',
+]);
+
+const DOC_MIME_MAP = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+};
 
 /**
  * @typedef {object} AttachedImage
@@ -812,9 +832,23 @@ const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
  * @property {number} size
  */
 
+/**
+ * @typedef {object} AttachedDocument
+ * @property {number} id
+ * @property {string} tag
+ * @property {string} filename
+ * @property {string} dataUri
+ * @property {string} source
+ * @property {number} size
+ */
+
 /** @type {Map<string, AttachedImage>} */
 const pendingImages = new Map();
 let nextImageId = 1;
+
+/** @type {Map<string, AttachedDocument>} */
+const pendingDocuments = new Map();
+let nextDocId = 1;
 
 /**
  * @param {string} dataUri
@@ -828,6 +862,108 @@ function registerImage(dataUri, source, size) {
   const item = { id, tag, dataUri, source, size };
   pendingImages.set(tag, item);
   return item;
+}
+
+/**
+ * @param {string} dataUri
+ * @param {string} filename
+ * @param {string} source
+ * @param {number} size
+ * @returns {AttachedDocument}
+ */
+function registerDocument(dataUri, filename, source, size) {
+  const id = nextDocId++;
+  const tag = `[file${id}]`;
+  const item = { id, tag, filename, dataUri, source, size };
+  pendingDocuments.set(tag, item);
+  return item;
+}
+
+/**
+ * Resolves a document file path.
+ * @param {string} candidate
+ * @returns {string | null}
+ */
+function resolveDocumentPath(candidate) {
+  if (!candidate || typeof candidate !== 'string') return null;
+  let p = candidate.trim();
+  if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+    p = p.slice(1, -1).trim();
+  }
+  if (p.startsWith('file://')) {
+    try {
+      p = decodeURIComponent(new URL(p).pathname);
+    } catch {
+      p = p.slice(7);
+    }
+  }
+  if (p.startsWith('~/') || p === '~') {
+    p = path.join(os.homedir(), p.slice(2));
+  }
+  const resolved = path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
+  const ext = path.extname(resolved).toLowerCase();
+  if (!DOCUMENT_EXTS.has(ext)) return null;
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      return resolved;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Attaches a document from a local file.
+ * @param {string} filePath
+ * @returns {AttachedDocument | null}
+ */
+function attachDocumentFromFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > 20 * 1024 * 1024) {
+      if (TTY) stdout.write('\r\n' + red(`  ✗ file too large: ${(stat.size / (1024 * 1024)).toFixed(1)} MB (max 20 MB)`) + '\r\n');
+      return null;
+    }
+    const buf = fs.readFileSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    const mime = DOC_MIME_MAP[ext] || 'application/octet-stream';
+    const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
+    const filename = path.basename(filePath);
+    return registerDocument(dataUri, filename, filePath, buf.length);
+  } catch (err) {
+    if (TTY) stdout.write('\r\n' + red(`  ✗ cannot read file: ${err.message}`) + '\r\n');
+    return null;
+  }
+}
+
+/**
+ * Scans a prompt line for [fileN] tags or direct document file paths.
+ * @param {string} text
+ * @returns {AttachedDocument[]}
+ */
+function getAttachedDocumentsForLine(text) {
+  /** @type {AttachedDocument[]} */
+  const attached = [];
+  const matchedTags = text.match(/\[file\d+\]/gi) || [];
+  for (const rawTag of matchedTags) {
+    const tag = rawTag.toLowerCase();
+    const doc = pendingDocuments.get(tag);
+    if (doc && !attached.some((x) => x.id === doc.id)) {
+      attached.push(doc);
+    }
+  }
+  const tokens = text.split(/\s+/);
+  for (const tok of tokens) {
+    const resolved = resolveDocumentPath(tok);
+    if (resolved) {
+      const reg = attachDocumentFromFile(resolved);
+      if (reg && !attached.some((x) => x.id === reg.id)) {
+        attached.push(reg);
+      }
+    }
+  }
+  return attached;
 }
 
 /** @param {string} filePath @returns {string} */
@@ -976,6 +1112,17 @@ function processPastedText(text) {
     if (reg) {
       if (TTY) {
         stdout.write(`\r\n\x1b[J${dim(`  📎 ${cyan(reg.tag)} attached (${reg.source}, ${(reg.size / 1024).toFixed(1)} KB)`)}\x1b[1A\x1b[${promptCol()}G`);
+      }
+      return reg.tag + ' ';
+    }
+  }
+
+  const singleDoc = resolveDocumentPath(text);
+  if (singleDoc) {
+    const reg = attachDocumentFromFile(singleDoc);
+    if (reg) {
+      if (TTY) {
+        stdout.write(`\r\n\x1b[J${dim(`  📄 ${cyan(reg.tag)} attached (${reg.filename}, ${(reg.size / 1024).toFixed(1)} KB)`)}\x1b[1A\x1b[${promptCol()}G`);
       }
       return reg.tag + ' ';
     }
@@ -1407,8 +1554,9 @@ const spinFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇
 /**
  * @param {string} text
  * @param {Array<{ tag: string, dataUri: string }>} [attachedImages]
+ * @param {Array<{ tag: string, filename: string, dataUri: string }>} [attachedFiles]
  */
-async function ask(text, attachedImages = []) {
+async function ask(text, attachedImages = [], attachedFiles = []) {
   const startedAt = Date.now();
   const W = termWidth();
   const md = makeRenderer();
@@ -1480,15 +1628,29 @@ async function ask(text, attachedImages = []) {
     raw = ''; rows = 0; col = 0;
   };
 
-  const messagesContent = attachedImages && attachedImages.length > 0
-    ? [
-        { type: 'text', text },
-        ...attachedImages.map((img) => ({
-          type: 'image_url',
-          image_url: { url: img.dataUri },
-        })),
-      ]
-    : text;
+  const hasImages = Array.isArray(attachedImages) && attachedImages.length > 0;
+  const hasFiles = Array.isArray(attachedFiles) && attachedFiles.length > 0;
+  let messagesContent;
+  if (hasImages || hasFiles) {
+    const parts = [];
+    if (text) parts.push({ type: 'text', text });
+    if (hasImages) {
+      for (const img of attachedImages) {
+        parts.push({ type: 'image_url', image_url: { url: img.dataUri } });
+      }
+    }
+    if (hasFiles) {
+      for (const f of attachedFiles) {
+        parts.push({
+          type: 'file',
+          file: { filename: f.filename, file_data: f.dataUri },
+        });
+      }
+    }
+    messagesContent = parts;
+  } else {
+    messagesContent = text;
+  }
 
   currentAbortController = new AbortController();
   isGenerating = true;
@@ -1496,7 +1658,12 @@ async function ask(text, attachedImages = []) {
   const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: messagesContent }] }),
+    body: JSON.stringify({
+      model,
+      stream: true,
+      messages: [{ role: 'user', content: messagesContent }],
+      ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+    }),
     signal: currentAbortController.signal,
   }).catch((/** @type {unknown} */ err) => {
     if (currentAbortController?.signal.aborted || (err instanceof Error && (err.name === 'AbortError' || (/** @type {any} */ (err).cause)?.name === 'AbortError'))) return null;
@@ -1657,9 +1824,36 @@ if (question) {
       process.exit(1);
     }
   }
+
+  let initialDocs = getAttachedDocumentsForLine(question);
+  if (FILES.length > 0) {
+    for (const f of FILES) {
+      const resolved = resolveDocumentPath(f);
+      if (resolved) {
+        const reg = attachDocumentFromFile(resolved);
+        if (reg && !initialDocs.some((x) => x.id === reg.id)) initialDocs.push(reg);
+      } else {
+        console.error(red(`✗ document file not found or unsupported: ${f}`));
+        process.exit(1);
+      }
+    }
+  }
+
   await maybeStartNew(question);
-  await ask(question, initialImages);
+  await ask(question, initialImages, initialDocs);
   process.exit(0);
+}
+
+if (FILES.length > 0) {
+  for (const f of FILES) {
+    const resolved = resolveDocumentPath(f);
+    if (resolved) {
+      const reg = attachDocumentFromFile(resolved);
+      if (reg) {
+        console.log(dim(`  📄 ${cyan(reg.tag)} attached (${reg.filename}, ${(reg.size / 1024).toFixed(1)} KB)`));
+      }
+    }
+  }
 }
 
 /* ------------------------------------------------------------- interactive */
@@ -1675,6 +1869,7 @@ function banner() {
   out(row(dim('model    ') + model));
   out(row(dim('session  ') + (status?.conversation ?? 'starts on first message')));
   out(row(dim('bridge   ') + BRIDGE.replace(/^https?:\/\//, '')));
+  if (thinkingLevel) out(row(dim('thinking ') + cyan(thinkingLevel)));
   out(gray('╰' + '─'.repeat(inner) + '╯'));
   out(dim('  type /  ·  ↑↓ choose  ·  Tab fill  ·  Enter run  ·  /help  ·  Ctrl+C'));
 }
@@ -1684,10 +1879,12 @@ function banner() {
 const COMMANDS = [
   ['/model',        'pick a model — ↑↓ then Enter, or /model <id>'],
   ['/models',       'print the model list'],
+  ['/thinking',     'set thinking level — ↑↓ then Enter, or /thinking <level>'],
   ['/conversations','switch conversation — ↑↓ then Enter'],
   ['/new',          'start a fresh conversation'],
   ['/agent',        'switch to agent mode — /agent  |  /agent <task> [--allow-run] [--max N]'],
   ['/agent-root',   `set root dir the agent may touch (now: ${agentRoot})`],
+  ['/file',         'attach a document — /file <path> [prompt] (PDF, Word, Excel, CSV, text)'],
   ['/image',        'attach an image file — /image <path> [prompt]'],
   ['/clip',         'paste image from clipboard — /clip [prompt]'],
   ['/clear',        'clear the screen'],
@@ -2076,11 +2273,12 @@ if (TTY) {
  *        `label` returns [main text, dim right-hand note] for each row.
  * @returns {Promise<T | null>}
  */
-function pickList(items, { current, label }) {
+function pickList(items, { current, label, width }) {
   return new Promise((resolve) => {
     let sel = Math.max(0, items.findIndex((it) => it.id === current));
     let painted = 0;
-    const mainW = Math.min(fmtWidth() - 20, 44);
+    const longestMain = items.length ? Math.max(...items.map((it) => stringWidth(label(it)[0] || ''))) : 20;
+    const mainW = Math.min(fmtWidth() - 20, width ?? Math.max(12, longestMain));
 
     const paint = () => {
       if (painted) stdout.write(`\x1b[${painted}A`);
@@ -2347,6 +2545,91 @@ for (;;) {
     continue;
   }
 
+  // `/thinking` on its own opens an ↑/↓ picker; `/thinking <level>` sets directly.
+  if (line === '/thinking' || line.startsWith('/thinking ')) {
+    const THINKING_LEVELS = [
+      { id: 'off',    note: 'disable reasoning traces' },
+      { id: 'low',    note: 'fast, concise reasoning' },
+      { id: 'medium', note: 'balanced thinking depth' },
+      { id: 'high',   note: 'deep reasoning for complex problems' },
+      { id: 'max',    note: 'maximum reasoning budget' },
+    ];
+    let level = line === '/thinking' ? '' : line.slice(9).trim().toLowerCase();
+    if (!level) {
+      if (!TTY) {
+        for (const t of THINKING_LEVELS) console.log(`  ${t.id === (thinkingLevel || 'off') ? '●' : ' '} ${t.id.padEnd(8)}  ${dim(t.note)}`);
+        continue;
+      }
+      const chosen = await pickList(THINKING_LEVELS, {
+        current: thinkingLevel || 'off',
+        label: (t) => [t.id, t.note],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      level = chosen.id;
+    }
+
+    if (!['low', 'medium', 'high', 'max', 'off'].includes(level)) {
+      console.log(dim(`  current thinking level: ${thinkingLevel || 'off'}`));
+      console.log(dim('  usage: /thinking <low | medium | high | max | off>'));
+      continue;
+    }
+    thinkingLevel = level === 'off' ? null : level;
+    console.log(dim(`  thinking level → ${thinkingLevel || 'off'}`));
+    continue;
+  }
+
+  if (line === '/file' || line.startsWith('/file ')) {
+    const rest = line.slice(5).trim();
+    if (!rest) {
+      console.log(dim('  usage: /file <path/to/document> [prompt]'));
+      continue;
+    }
+    let rawPath = '';
+    let prompt = '';
+    if (rest.startsWith('"') || rest.startsWith("'")) {
+      const q = rest[0];
+      const endQuote = rest.indexOf(q, 1);
+      if (endQuote !== -1) {
+        rawPath = rest.slice(1, endQuote);
+        prompt = rest.slice(endQuote + 1).trim();
+      } else {
+        rawPath = rest;
+      }
+    } else {
+      const spaceIdx = rest.indexOf(' ');
+      if (spaceIdx !== -1) {
+        rawPath = rest.slice(0, spaceIdx);
+        prompt = rest.slice(spaceIdx + 1).trim();
+      } else {
+        rawPath = rest;
+      }
+    }
+
+    const resolved = resolveDocumentPath(rawPath);
+    if (!resolved) {
+      console.log(red(`  ✗ document not found or unsupported format: ${rawPath}`));
+      continue;
+    }
+    const reg = attachDocumentFromFile(resolved);
+    if (!reg) continue;
+
+    console.log(dim(`  📄 ${cyan(reg.tag)} attached (${reg.filename}, ${(reg.size / 1024).toFixed(1)} KB)`));
+    if (prompt) {
+      const fullText = `${prompt} ${reg.tag}`;
+      if (agentMode) {
+        await runAgentTask(fullText, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply, attachedDocuments: [reg] });
+      } else {
+        await maybeStartNew(fullText);
+        await ask(fullText, [], [reg]);
+      }
+      pendingDocuments.clear();
+      nextDocId = 1;
+    } else {
+      rl.write(reg.tag + ' ');
+    }
+    continue;
+  }
+
   if (line === '/new') {
     pendingNew = true;
     console.log(dim('  next message starts a fresh conversation'));
@@ -2422,9 +2705,14 @@ for (;;) {
 
   out();
   const attached = getAttachedImagesForLine(line);
+  const attachedDocs = getAttachedDocumentsForLine(line);
   if (attached.length > 0) {
     const names = attached.map((img) => `${cyan(img.tag)} (${img.source})`).join(', ');
     out('  ' + dim(`📎 attached: ${names}`));
+  }
+  if (attachedDocs.length > 0) {
+    const names = attachedDocs.map((doc) => `${cyan(doc.tag)} (${doc.filename})`).join(', ');
+    out('  ' + dim(`📄 attached: ${names}`));
   }
 
   // In agent mode, plain messages run as agent tasks instead of chat
@@ -2433,9 +2721,11 @@ for (;;) {
     await runAgentTask(line, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply, attachedImages: attached });
   } else {
     await maybeStartNew(line);
-    await ask(line, attached);
+    await ask(line, attached, attachedDocs);
   }
   pendingImages.clear();
   nextImageId = 1;
+  pendingDocuments.clear();
+  nextDocId = 1;
 }
 rl.close();
