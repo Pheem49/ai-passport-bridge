@@ -1277,9 +1277,10 @@ function getAttachedImagesForLine(text) {
 /**
  * @param {string} text
  * @param {Array<{ tag: string, dataUri: string }>} [images]
+ * @param {AttachedDocument[]} [files]
  * @returns {Promise<string>}
  */
-async function sayAgent(text, images = []) {
+async function sayAgent(text, images = [], files = []) {
   const startedAt = Date.now();
   /** @type {ReturnType<typeof setInterval> | null} */
   let timer = null;
@@ -1297,13 +1298,13 @@ async function sayAgent(text, images = []) {
     if (TTY) stdout.write('\r\x1b[K');
   };
 
-  const messagesContent = images && images.length > 0
+  const hasImages = Array.isArray(images) && images.length > 0;
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  const messagesContent = hasImages || hasFiles
     ? [
         { type: 'text', text },
-        ...images.map((img) => ({
-          type: 'image_url',
-          image_url: { url: img.dataUri },
-        })),
+        ...(hasImages ? images.map((img) => ({ type: 'image_url', image_url: { url: img.dataUri } })) : []),
+        ...(hasFiles ? files.map((f) => ({ type: 'file', file: { filename: f.filename, file_data: f.dataUri } })) : []),
       ]
     : text;
 
@@ -1382,11 +1383,12 @@ function agentRedact(text) {
  * @param {string} text
  * @param {number} [depth]
  * @param {Array<{ tag: string, dataUri: string }>} [images]
+ * @param {AttachedDocument[]} [files]
  * @returns {Promise<string>}
  */
-async function sayResilient(text, depth = 0, images = []) {
+async function sayResilient(text, depth = 0, images = [], files = []) {
   if (depth === 0) text = agentOutbound(text);
-  try { return await sayAgent(text, depth === 0 ? images : []); }
+  try { return await sayAgent(text, depth === 0 ? images : [], depth === 0 ? files : []); }
   catch (err) {
     const blocked = /\b40[39]\b/.test(/** @type {Error} */ (err).message);
     if (!blocked) throw err;
@@ -1522,7 +1524,7 @@ function agentShowDiff() {
  * @param {string} taskText
  * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null, attachedImages?: Array<{ tag: string, dataUri: string }>, attachedDocuments?: AttachedDocument[] }} [opts]
  */
-async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [], attachedDocuments: _attachedDocuments = [] } = {}) {
+async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [], attachedDocuments = [] } = {}) {
   // autoApply: null = ask y/N, true = apply automatically, false = dry run
   overlay.clear();
   const prevAllowRun = agentAllowRun;
@@ -1554,7 +1556,7 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     out(bold(dim(`  ─── agent step ${step}/${maxSteps} ${'─'.repeat(36)}`)));
 
     let reply;
-    try { reply = await sayResilient(next, 0, step === 1 ? attachedImages : []); }
+    try { reply = await sayResilient(next, 0, step === 1 ? attachedImages : [], step === 1 ? attachedDocuments : []); }
     catch (err) { out(red(`  ✗ ${/** @type {Error} */ (err).message}`)); break; }
     reply = reply != null ? agentInbound(reply) : '';
 
