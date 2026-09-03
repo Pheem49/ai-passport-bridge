@@ -6,8 +6,7 @@
 // Private Network Access checks; an extension request with host_permissions
 // does not.
 const DEFAULT_BRIDGE = 'http://127.0.0.1:8787';
-const RECONNECT_MS = 3000;
-const CYCLE_MS = 4 * 60 * 1000; // reconnect before Chrome's long-request ceiling
+const RECONNECT_MS = 500;
 
 let controller = null;
 let connected = false;
@@ -120,10 +119,13 @@ function handleEvent(name, data) {
 }
 
 async function connect() {
-  if (controller) return;
+  if (connected) return;
+  if (controller) {
+    try { controller.abort(); } catch { /* ignore */ }
+    controller = null;
+  }
   controller = new AbortController();
   const signal = controller.signal;
-  const cycle = setTimeout(() => controller?.abort(), CYCLE_MS);
 
   try {
     const res = await fetch(`${await bridgeUrl()}/ext/events`, {
@@ -161,7 +163,6 @@ async function connect() {
   } catch (err) {
     if (err?.name !== 'AbortError') lastError = String(err?.message ?? err);
   } finally {
-    clearTimeout(cycle);
     connected = false;
     controller = null;
     setTimeout(connect, RECONNECT_MS);
@@ -171,8 +172,10 @@ async function connect() {
 // A content script holds this port open so Chrome does not evict the worker.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'keepalive') return;
-  connect(); // a de.aipass.net tab just appeared (or the worker just woke)
-  port.onMessage.addListener(() => {});
+  if (!connected) connect(); // a de.aipass.net tab just appeared (or the worker just woke)
+  port.onMessage.addListener(() => {
+    if (!connected) connect();
+  });
   port.onDisconnect.addListener(() => { void chrome.runtime.lastError; });
 });
 
@@ -212,8 +215,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // The worker can be evicted at any time; the alarm brings it back and the
 // connect() guard makes a duplicate call harmless.
-chrome.alarms.create('keepalive', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener(() => connect());
-chrome.runtime.onStartup.addListener(() => connect());
-chrome.runtime.onInstalled.addListener(() => connect());
+chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(() => { if (!connected) connect(); });
+chrome.runtime.onStartup.addListener(() => { if (!connected) connect(); });
+chrome.runtime.onInstalled.addListener(() => { if (!connected) connect(); });
 connect();

@@ -1,5 +1,6 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { startBridge, FakeExtension, scripted, run, CHAT } from './harness.mjs';
 
 let bridge;
@@ -55,4 +56,62 @@ test('exits with a clear message when the bridge is down', async () => {
   const { out, code } = await run(CHAT, ['hi', '--bridge', 'http://127.0.0.1:1']);
   assert.equal(code, 1);
   assert.match(out, /No bridge at/);
+});
+
+test('sends image part when --image is provided', async (t) => {
+  /** @type {any} */
+  let receivedParts = null;
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => {
+      receivedParts = job.parts;
+      await e.text('I see an image');
+      await e.done();
+    },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const imgPath = path.resolve(import.meta.dirname, '../../public/image.png');
+  const { out, code } = await chat(['describe this image', '--image', imgPath]);
+  assert.equal(code, 0);
+  assert.match(out, /I see an image/);
+  assert.ok(receivedParts, 'bridge should receive parts');
+  const imgPart = receivedParts.find((/** @type {any} */ p) => p.type === 'image');
+  assert.ok(imgPart, 'parts should contain an image part');
+  assert.match(imgPart.image, /^data:image\/png;base64,/);
+});
+
+test('auto-detects and attaches inline image file path in chat prompt', async (t) => {
+  /** @type {any} */
+  let receivedParts = null;
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => {
+      receivedParts = job.parts;
+      await e.text('Analyzed inline image');
+      await e.done();
+    },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const imgPath = path.resolve(import.meta.dirname, '../../public/image.png');
+  const { out, code } = await chat([`describe ${imgPath}`]);
+  assert.equal(code, 0);
+  assert.match(out, /Analyzed inline image/);
+  assert.ok(receivedParts, 'bridge should receive parts');
+  const imgPart = receivedParts.find((/** @type {any} */ p) => p.type === 'image');
+  assert.ok(imgPart, 'inline image path should be attached as image part');
+  assert.match(imgPart.image, /^data:image\/png;base64,/);
+});
+
+test('handles aborted stream without crashing', async (t) => {
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => {
+      await e.text('First chunk...');
+      await e.done();
+    },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out, code } = await chat(['quick test']);
+  assert.equal(code, 0);
+  assert.match(out, /First chunk/);
 });

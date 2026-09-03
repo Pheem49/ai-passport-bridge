@@ -5,7 +5,7 @@
 <p align="left">
   <img src="https://img.shields.io/badge/node-%E2%89%A518-blue?logo=node.js&style=flat-square" alt="Node >= 18" />
   <img src="https://img.shields.io/badge/dependencies-zero-success?style=flat-square" alt="Zero Dependencies" />
-  <img src="https://img.shields.io/badge/tests-45%20passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-49%20passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgray?style=flat-square" alt="Platforms" />
 </p>
 
@@ -33,10 +33,17 @@ terminal / CLI ──HTTP──▶ bridge (node, zero dependencies)
 
 - 💬 **Interactive Terminal Chat (TUI):**
   - Live token streaming with markdown formatting (headers, lists, tables, code blocks).
-  - Braille spinner with thinking elapsed time.
-  - Interactive slash-command menu (`/`) with keyboard navigation (↑/↓, Tab, Enter, Esc).
-  - Full rounded prompt box with bracketed paste mode (pasted multiline text won't accidentally auto-submit).
-  - Native Unicode & Thai tone mark alignment.
+  - Immediate 4-sided rounded message card upon prompt submission (`╭─╮`, `│ text │`, `╰─╯`).
+  - Braille spinner with thinking elapsed time and inline composer (`Type to queue next message · Esc to stop`).
+  - Prompt queueing: type your next message ahead of time and auto-dispatch upon turn completion.
+  - Instant stream interruption: press `Esc` or `Ctrl+C` to cleanly abort generation at any moment (`⏹ response stopped by user`).
+  - Interactive slash-command menu (`/`) with 5-item pagination, navigation header (`Suggestions (1/13)`), and arrow-key browsing.
+  - Bracketed paste mode (pasted multiline text won't accidentally auto-submit).
+  - Native Unicode & Thai tone mark width alignment.
+  - 🖼️ **Multimodal Image Support (`[image1]`):**
+    - Paste images directly from OS clipboard using `Alt+V` (or `Ctrl+V`).
+    - Drag-and-drop or paste image paths (`.png`, `.jpg`, `.webp`) — automatically converts to `[image1]`.
+    - Slash commands `/clip [prompt]` and `/image <path> [prompt]` for instant attachment.
 
 - 🤖 **Autonomous Coding Agent (`/agent` or `aipass agent`):**
   - Runs in **Chat Mode** or **Agent Mode** directly within the TUI, or as a standalone CLI.
@@ -92,8 +99,11 @@ Log in at [https://de.aipass.net/chat](https://de.aipass.net/chat) and keep the 
 ### 4. Start Chatting!
 
 ```bash
-aipass status     # Verify Node, Bridge, and Extension connection
-aipass            # Launch interactive terminal chat (auto-starts bridge)
+# Terminal 1: Start the local bridge (foreground with live logs)
+aipass dev        # or: npm run dev
+
+# Terminal 2: Launch interactive terminal chat
+aipass
 ```
 
 ---
@@ -105,6 +115,7 @@ aipass            # Launch interactive terminal chat (auto-starts bridge)
 aipass                                 # Interactive TUI chat
 aipass "Explain quantum computing"     # One-shot question from CLI
 aipass --new                           # Start a fresh conversation immediately
+aipass "Describe this" --image ./img.png # Send with attached image file
 
 # Agent Tasks
 aipass agent "Fix the navbar bug"      # Run autonomous agent on the current directory
@@ -112,23 +123,24 @@ aipass agent "Refactor utils" --apply  # Run agent and apply file modifications 
 aipass agent "Run tests" --allow-run   # Allow shell execution (`RUN` commands)
 
 # Utility & Management
+aipass dev                             # Run bridge in foreground (live logs, Ctrl+C to stop)
 aipass status                          # Check health of Node, Bridge, and Extension
 aipass models                          # List available models (free-credit models marked)
 aipass conversations                   # List recent conversations on your account
-aipass dev                             # Run bridge in the foreground (for debugging)
-aipass stop                            # Stop background bridge daemon
 ```
 
 ---
 
 ## ⌨️ TUI Slash Commands
 
-While in the interactive `aipass` chat, type `/` to open the interactive command palette:
+While in the interactive `aipass` chat, type `/` to open the interactive command palette (navigated in 5-item pages with `↑/↓` or `Tab`):
 
 | Command | Description |
 |---|---|
 | `/agent` | Toggle between **Chat Mode** and **Autonomous Agent Mode** (or run a single agent task) |
 | `/agent-root <dir>` | Change the target directory the agent operates on |
+| `/clip [prompt]` | Paste image from OS clipboard with optional prompt (shortcut: `Alt+V`) |
+| `/image <path> [prompt]` | Attach local image file with optional prompt |
 | `/model` | Open an interactive arrow-key selector to switch AI models |
 | `/models` | Print the full list of available models |
 | `/conversations` | Open an arrow-key selector to switch between past conversations |
@@ -208,7 +220,7 @@ This monorepo contains two components:
 │   ├── extension/           # Chrome Manifest V3 extension
 │   ├── chat.mjs             # Interactive TUI chat client
 │   ├── agent.mjs            # Autonomous coding agent loop
-│   ├── test/                # Test suite (45 native Node.js tests)
+│   ├── test/                # Test suite (49 native Node.js tests)
 │   ├── README.md            # Detailed bridge documentation
 │   └── DOCS.md              # In-depth architectural internals
 │
@@ -233,7 +245,7 @@ This monorepo contains two components:
 
 ## 🧪 Testing
 
-Run the comprehensive test suite (45 integration and unit tests covering WAF evasion, streaming, tools, pagination, and CLI edge cases):
+Run the comprehensive test suite (49 integration and unit tests covering WAF evasion, streaming, tools, pagination, and CLI edge cases):
 
 ```bash
 npm test

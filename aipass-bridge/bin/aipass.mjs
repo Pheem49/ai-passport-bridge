@@ -47,31 +47,20 @@ const bridgeUp = () =>
     .then((r) => r.ok)
     .catch(() => false);
 
-/** Start the bridge detached and wait for it to answer. No-op if it's up. */
+/** Ensure the bridge is running. Warn and exit if not. */
 async function ensureBridge() {
   if (await bridgeUp()) return;
-  mkdirSync(STATE, { recursive: true });
-  const fd = openSync(LOGFILE, 'a');
-  const child = spawn(process.execPath, [sibling('bridge/server.mjs')], {
-    detached: true,
-    stdio: ['ignore', fd, fd],
-    windowsHide: true,   // no console flash on Windows
-    env: process.env,
-  });
-  child.unref();
-  closeSync(fd);
-  if (child.pid) writeFileSync(PIDFILE, String(child.pid));
-  process.stderr.write(dim(`  started the bridge (pid ${child.pid}) — logs: ${LOGFILE}\n`));
-  for (let i = 0; i < 40; i++) {
-    if (await bridgeUp()) return;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  process.stderr.write(red(`  the bridge did not come up within 4s — check ${LOGFILE}\n`));
+  process.stderr.write(
+    red(`\n✗ Bridge not running at ${BRIDGE}\n`) +
+    dim(`  Please start the bridge in a separate terminal:\n`) +
+    `  ${dim('$')} \x1b[36maipass dev\x1b[0m   ${dim('(or npm run dev)')}\n\n`
+  );
+  process.exit(1);
 }
 
 function stopBridge() {
   if (!existsSync(PIDFILE)) {
-    console.log('no bridge to stop (aipass has not started one; a `npm run dev` / `aipass dev` bridge you stop with Ctrl+C)');
+    console.log('no background bridge running (a `aipass dev` / `npm run dev` bridge you stop with Ctrl+C)');
     return;
   }
   const pid = Number(readFileSync(PIDFILE, 'utf8').trim());
@@ -85,7 +74,7 @@ async function status() {
   console.log(`node          ${process.versions.node}${major >= 18 ? '' : red('  ✗ need >= 18')}`);
 
   const up = await bridgeUp();
-  console.log(`bridge        ${up ? `${BRIDGE}  ok` : `${BRIDGE}  ${red('not reachable')} — run \`aipass\` (auto-starts it) or \`aipass dev\``}`);
+  console.log(`bridge        ${up ? `${BRIDGE}  ok` : `${BRIDGE}  ${red('not running')} — run \`aipass dev\` (or npm run dev)`}`);
   if (!up) return;
 
   const s = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null);
@@ -98,14 +87,14 @@ async function status() {
 
 const HELP = `aipass — de.aipass.net from your terminal
 
-  aipass                 open the chat (starts the bridge if needed)
-  aipass "question"      one-shot
-  aipass dev             run the bridge in the foreground
+  aipass dev             start the bridge server in the foreground (Ctrl+C to stop)
+  aipass                 open the chat TUI (requires bridge running)
+  aipass "question"      one-shot question
   aipass agent "task"    run the file agent against the current directory
   aipass models          list models
   aipass conversations   list conversations
-  aipass status          check node / bridge / extension
-  aipass stop            stop a bridge that aipass started
+  aipass status          check node / bridge / extension status
+  aipass stop            stop any lingering background bridge
 
   env: AIPASS_PORT (${PORT}), AIPASS_HOST (${HOST})`;
 

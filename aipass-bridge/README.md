@@ -81,7 +81,12 @@ aipass status     # node ≥ 18? bridge up? extension connected?
 Then:
 
 ```bash
-aipass            # start chatting — auto-starts the bridge in the background
+# Terminal 1: Run the bridge in foreground (with live logs)
+aipass dev        # or: npm run dev
+
+# Terminal 2: Start chatting
+aipass            # interactive TUI chat
+aipass "question" # one-shot answer from CLI
 ```
 
 | command | |
@@ -91,11 +96,8 @@ aipass            # start chatting — auto-starts the bridge in the background
 | `aipass agent "task"` | file agent against **the current directory** |
 | `aipass models` · `aipass conversations` | the list printers |
 | `aipass status` | node / bridge / extension check |
-| `aipass stop` | stop a bridge that `aipass` auto-started |
 
-The auto-started bridge logs to `~/.aipass/bridge.log`; its pid is in
-`~/.aipass/bridge.pid`. Uninstall with `rm -f ~/.local/bin/aipass` (or
-`npm rm -g aipass` if you used `npm link`).
+Uninstall with `rm -f ~/.local/bin/aipass` (or `npm rm -g aipass` if you used `npm link`).
 
 Every machine talks to the **same de.aipass.net account** — chat history is
 shared, and only `gemini-3.1-flash-lite` is free-credit.
@@ -164,6 +166,8 @@ Type `/` to open the command menu — **↑/↓** to choose, **Tab** to fill it 
 | `/models` | print the model list |
 | `/conversations` | switch conversation — an **↑/↓** picker; **Enter** switches, **Esc** cancels |
 | `/new` | the *next* message starts a fresh conversation, titled by that message |
+| `/image` | attach local image file — `/image <path> [prompt]` |
+| `/clip` | paste image directly from clipboard — `/clip [prompt]` |
 | `/clear` | clear the screen |
 | `/help` | list the commands |
 

@@ -13,7 +13,8 @@ import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import os from 'node:os';
+import { execSync, spawnSync } from 'node:child_process';
 
 /**
  * @typedef {object} BridgeStatus
@@ -56,6 +57,7 @@ const flag = (name, fallback = null) => {
 
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787') ?? '').replace(/\/+$/, '');
 const CONVERSATION = flag('conversation', null);
+const imageArg = flag('image', null);
 // `--new` / `/new` don't create a conversation up front — that would seed the
 // account's chat list with a throwaway "New chat." entry. Instead we defer:
 // the next message the user actually sends becomes the seed, so the entry is
@@ -90,11 +92,55 @@ const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 /** @param {string} s */
 const visLen = (s) => stripAnsi(s).length;
 const termWidth = () => stdout.columns || 80;                    // real wrap point
+const termHeight = () => stdout.rows || 24;
 const fmtWidth = () => Math.max(40, Math.min(termWidth(), 100)); // reading width
 /** @param {string} [s] */
 const out = (s = '') => stdout.write(s + '\n');
 /** @param {string} s @param {number} n */
 const truncate = (s, n) => (s.length <= n ? s : s.slice(0, Math.max(1, n - 1)) + '…');
+
+const boxRule = (/** @type {string} */ l, /** @type {string} */ r) =>
+  gray(l + '─'.repeat(Math.max(2, termWidth() - 3)) + r);
+const topRule = () => boxRule('╭', '╮');
+const botRule = () => boxRule('╰', '╯');
+
+const stringWidth = (s) => {
+  const clean = stripAnsi(s).replace(/[\u0E31\u0E34-\u0E3A\u0E47-\u0E4E]/g, '');
+  let w = 0;
+  for (const ch of clean) {
+    const cp = ch.codePointAt(0) || 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE10 && cp <= 0xFE19) || (cp >= 0xFE30 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F9FF)) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+};
+
+let isGenerating = false;
+let isSpinning = false;
+let queuedInput = '';
+/** @type {string[]} */
+const promptQueue = [];
+/** @type {AbortController | null} */
+let currentAbortController = null;
+
+function updateComposerLine() {
+  if (!TTY || !isSpinning) return;
+  const inner = Math.max(2, termWidth() - 3);
+  const maxW = inner - 2;
+  const text = queuedInput
+    ? `${queuedInput} ${yellow('[queued]')}`
+    : dim('Type to queue next message · Esc to stop');
+  const vLen = stringWidth(text);
+  const pad = Math.max(0, maxW - 2 - vLen);
+  const line = gray('│') + ' ' + cyan('❯') + ' ' + text + ' '.repeat(pad) + gray('│');
+  const cursorCol = 5 + stringWidth(queuedInput);
+  stdout.write(`\r\x1b[K${line}\x1b[${cursorCol}G`);
+}
 
 /** Compact "2h ago" / "3d ago" from an ISO timestamp. @param {string} [iso] */
 function relative(iso) {
@@ -753,10 +799,249 @@ function agentParse(reply) {
   return calls;
 }
 
+/* ---------------------------------------------------- multimodal / image attach */
+
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+
+/**
+ * @typedef {object} AttachedImage
+ * @property {number} id
+ * @property {string} tag
+ * @property {string} dataUri
+ * @property {string} source
+ * @property {number} size
+ */
+
+/** @type {Map<string, AttachedImage>} */
+const pendingImages = new Map();
+let nextImageId = 1;
+
+/**
+ * @param {string} dataUri
+ * @param {string} source
+ * @param {number} size
+ * @returns {AttachedImage}
+ */
+function registerImage(dataUri, source, size) {
+  const id = nextImageId++;
+  const tag = `[image${id}]`;
+  const item = { id, tag, dataUri, source, size };
+  pendingImages.set(tag, item);
+  return item;
+}
+
+/** @param {string} filePath @returns {string} */
+function getMimeType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.bmp') return 'image/bmp';
+  return 'application/octet-stream';
+}
+
+/**
+ * Resolves an image file path (handling quotes, file://, ~, relative paths).
+ * Returns absolute path if valid image file exists, else null.
+ * @param {string} candidate
+ * @returns {string | null}
+ */
+function resolveImagePath(candidate) {
+  if (!candidate || typeof candidate !== 'string') return null;
+  let p = candidate.trim();
+  if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+    p = p.slice(1, -1).trim();
+  }
+  if (p.startsWith('file://')) {
+    try {
+      p = decodeURIComponent(new URL(p).pathname);
+    } catch {
+      p = p.slice(7);
+    }
+  }
+  if (p.startsWith('~/') || p === '~') {
+    p = path.join(os.homedir(), p.slice(2));
+  }
+  const resolved = path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
+  const ext = path.extname(resolved).toLowerCase();
+  if (!IMAGE_EXTS.has(ext)) return null;
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      return resolved;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Reads an image from the OS clipboard without external dependencies.
+ * @returns {{ buffer: Buffer, mime: string, source: string } | null}
+ */
+function readClipboardImage() {
+  try {
+    if (process.platform === 'linux') {
+      if (process.env.WAYLAND_DISPLAY || process.env.XDG_SESSION_TYPE === 'wayland') {
+        const check = spawnSync('wl-paste', ['--list-types'], { encoding: 'utf8', timeout: 1500 });
+        if (check.status === 0 && check.stdout && /image\/(png|jpeg|jpg|webp)/i.test(check.stdout)) {
+          const m = check.stdout.match(/image\/(png|jpeg|jpg|webp)/i);
+          const mime = m ? m[0].toLowerCase() : 'image/png';
+          const res = spawnSync('wl-paste', ['--type', mime], { timeout: 3000, maxBuffer: 15 * 1024 * 1024 });
+          if (res.status === 0 && res.stdout && res.stdout.length > 0) {
+            return { buffer: Buffer.isBuffer(res.stdout) ? res.stdout : Buffer.from(res.stdout), mime, source: 'clipboard' };
+          }
+        }
+      }
+      const checkX = spawnSync('xclip', ['-selection', 'clipboard', '-target', 'TARGETS', '-o'], { encoding: 'utf8', timeout: 1500 });
+      if (checkX.status === 0 && checkX.stdout && /image\/(png|jpeg|jpg|webp)/i.test(checkX.stdout)) {
+        const m = checkX.stdout.match(/image\/(png|jpeg|jpg|webp)/i);
+        const mime = m ? m[0].toLowerCase() : 'image/png';
+        const res = spawnSync('xclip', ['-selection', 'clipboard', '-t', mime, '-o'], { timeout: 3000, maxBuffer: 15 * 1024 * 1024 });
+        if (res.status === 0 && res.stdout && res.stdout.length > 0) {
+          return { buffer: Buffer.isBuffer(res.stdout) ? res.stdout : Buffer.from(res.stdout), mime, source: 'clipboard' };
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      const pp = spawnSync('pngpaste', ['-'], { timeout: 2000, maxBuffer: 15 * 1024 * 1024 });
+      if (pp.status === 0 && pp.stdout && pp.stdout.length > 0) {
+        return { buffer: pp.stdout, mime: 'image/png', source: 'clipboard' };
+      }
+      const tmpPath = path.join(os.tmpdir(), `aipass-clip-${Date.now()}.png`);
+      const script = `try\nset clip to (get the clipboard as «class PNGf»)\nset fn to "${tmpPath}"\nset f to open for access (POSIX file fn) with write permission\nset eof f to 0\nwrite clip to f\nclose access f\nreturn "ok"\non error\nreturn "fail"\nend try`;
+      const res = spawnSync('osascript', ['-e', script], { encoding: 'utf8', timeout: 3000 });
+      if (res.status === 0 && res.stdout.trim() === 'ok' && fs.existsSync(tmpPath)) {
+        const buf = fs.readFileSync(tmpPath);
+        try { fs.unlinkSync(tmpPath); } catch {}
+        if (buf.length > 0) return { buffer: buf, mime: 'image/png', source: 'clipboard' };
+      }
+    } else if (process.platform === 'win32') {
+      const ps = `Add-Type -AssemblyName System.Windows.Forms; $clip = [System.Windows.Forms.Clipboard]::GetImage(); if ($clip) { $ms = New-Object System.IO.MemoryStream; $clip.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($ms.ToArray()) }`;
+      const res = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 4000 });
+      if (res.status === 0 && res.stdout.trim()) {
+        const buf = Buffer.from(res.stdout.trim(), 'base64');
+        return { buffer: buf, mime: 'image/png', source: 'clipboard' };
+      }
+    }
+  } catch {
+    // ignore clipboard errors
+  }
+  return null;
+}
+
+/**
+ * Attaches an image from a local file.
+ * @param {string} filePath
+ * @returns {AttachedImage | null}
+ */
+function attachImageFromFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > 10 * 1024 * 1024) {
+      if (TTY) stdout.write('\r\n' + red(`  ✗ image too large: ${(stat.size / (1024 * 1024)).toFixed(1)} MB (max 10 MB)`) + '\r\n');
+      return null;
+    }
+    const buf = fs.readFileSync(filePath);
+    const mime = getMimeType(filePath);
+    const dataUri = `data:${mime};base64,${buf.toString('base64')}`;
+    const filename = path.basename(filePath);
+    return registerImage(dataUri, filename, buf.length);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Attaches an image from the OS clipboard.
+ * @returns {AttachedImage | null}
+ */
+function attachImageFromClipboard() {
+  const clip = readClipboardImage();
+  if (!clip) return null;
+  const dataUri = `data:${clip.mime};base64,${clip.buffer.toString('base64')}`;
+  return registerImage(dataUri, 'clipboard', clip.buffer.length);
+}
+
+/**
+ * Detects image file paths in pasted text and converts them to tags like [image1].
+ * @param {string} text
+ * @returns {string}
+ */
+function processPastedText(text) {
+  if (!text) return text;
+  const single = resolveImagePath(text);
+  if (single) {
+    const reg = attachImageFromFile(single);
+    if (reg) {
+      if (TTY) {
+        stdout.write(`\r\n\x1b[J${dim(`  📎 ${cyan(reg.tag)} attached (${reg.source}, ${(reg.size / 1024).toFixed(1)} KB)`)}\x1b[1A\x1b[${promptCol()}G`);
+      }
+      return reg.tag + ' ';
+    }
+  }
+
+  const regex = /(?:["'](?:file:\/\/[^"']+|[~/.A-Za-z0-9_ -]+\.(?:png|jpe?g|webp|gif|bmp))["']|file:\/\/\S+|[~/.][^\s"']+\.(?:png|jpe?g|webp|gif|bmp))/gi;
+  let hasReplacement = false;
+  const replaced = text.replace(regex, (match) => {
+    const resolved = resolveImagePath(match);
+    if (resolved) {
+      const reg = attachImageFromFile(resolved);
+      if (reg) {
+        hasReplacement = true;
+        return reg.tag;
+      }
+    }
+    return match;
+  });
+
+  if (hasReplacement && TTY) {
+    const latest = Array.from(pendingImages.values()).slice(-1)[0];
+    if (latest) {
+      stdout.write(`\r\n\x1b[J${dim(`  📎 ${cyan(latest.tag)} attached (${latest.source})`)}\x1b[1A\x1b[${promptCol()}G`);
+    }
+  }
+
+  return replaced;
+}
+
+/**
+ * Scans a prompt line for [imageN] tags or direct image file paths.
+ * @param {string} text
+ * @returns {AttachedImage[]}
+ */
+function getAttachedImagesForLine(text) {
+  /** @type {AttachedImage[]} */
+  const attached = [];
+  const matchedTags = text.match(/\[image\d+\]/gi) || [];
+  for (const rawTag of matchedTags) {
+    const tag = rawTag.toLowerCase();
+    const img = pendingImages.get(tag);
+    if (img && !attached.some((x) => x.id === img.id)) {
+      attached.push(img);
+    }
+  }
+  const tokens = text.split(/\s+/);
+  for (const tok of tokens) {
+    const resolved = resolveImagePath(tok);
+    if (resolved) {
+      const reg = attachImageFromFile(resolved);
+      if (reg && !attached.some((x) => x.id === reg.id)) {
+        attached.push(reg);
+      }
+    }
+  }
+  return attached;
+}
+
 /* ----------------------------------------- sayAgent (fetch, returns string) */
 
-/** @param {string} text @returns {Promise<string>} */
-async function sayAgent(text) {
+/**
+ * @param {string} text
+ * @param {Array<{ tag: string, dataUri: string }>} [images]
+ * @returns {Promise<string>}
+ */
+async function sayAgent(text, images = []) {
   const startedAt = Date.now();
   /** @type {ReturnType<typeof setInterval> | null} */
   let timer = null;
@@ -774,10 +1059,21 @@ async function sayAgent(text) {
     if (TTY) stdout.write('\r\x1b[K');
   };
 
+  const messagesContent = images && images.length > 0
+    ? [
+        { type: 'text', text },
+        ...images.map((img) => ({
+          type: 'image_url',
+          image_url: { url: img.dataUri },
+        })),
+      ]
+    : text;
+
   const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: text }] }),
+    body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: messagesContent }] }),
+    ...(currentAbortController ? { signal: currentAbortController.signal } : {}),
   });
   if (!res.ok) throw new Error(`bridge returned ${res.status}: ${(await res.text()).slice(0, 300)}`);
 
@@ -787,7 +1083,18 @@ async function sayAgent(text) {
   const decoder = new TextDecoder();
   let buf = '';
   for (;;) {
-    const { value, done } = await reader.read();
+    let readResult;
+    try {
+      readResult = await reader.read();
+    } catch (err) {
+      if (err && /** @type {any} */ (err).name === 'AbortError') {
+        stopSpin();
+        out('\n  ' + yellow('⏹ agent task stopped by user'));
+        break;
+      }
+      throw err;
+    }
+    const { value, done } = readResult;
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     let cut;
@@ -836,11 +1143,12 @@ function agentRedact(text) {
 /**
  * @param {string} text
  * @param {number} [depth]
+ * @param {Array<{ tag: string, dataUri: string }>} [images]
  * @returns {Promise<string>}
  */
-async function sayResilient(text, depth = 0) {
+async function sayResilient(text, depth = 0, images = []) {
   if (depth === 0) text = agentOutbound(text);
-  try { return await sayAgent(text); }
+  try { return await sayAgent(text, depth === 0 ? images : []); }
   catch (err) {
     const blocked = /\b40[39]\b/.test(/** @type {Error} */ (err).message);
     if (!blocked) throw err;
@@ -974,13 +1282,18 @@ function agentShowDiff() {
 
 /**
  * @param {string} taskText
- * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null }} [opts]
+ * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null, attachedImages?: Array<{ tag: string, dataUri: string }> }} [opts]
  */
-async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null } = {}) {
+async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [] } = {}) {
   // autoApply: null = ask y/N, true = apply automatically, false = dry run
   overlay.clear();
   const prevAllowRun = agentAllowRun;
   agentAllowRun = allowRun;
+
+  currentAbortController = new AbortController();
+  isGenerating = true;
+
+  try {
 
   // Normalize absolute paths within agentRoot to relative paths so the model isn't confused
   const cleanRoot = agentRoot.replace(/[/\\]+$/, '');
@@ -1003,7 +1316,7 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     out(bold(dim(`  ─── agent step ${step}/${maxSteps} ${'─'.repeat(36)}`)));
 
     let reply;
-    try { reply = await sayResilient(next); }
+    try { reply = await sayResilient(next, 0, step === 1 ? attachedImages : []); }
     catch (err) { out(red(`  ✗ ${/** @type {Error} */ (err).message}`)); break; }
     reply = reply != null ? agentInbound(reply) : '';
 
@@ -1080,15 +1393,22 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
       out(dim('  dry run — nothing written.'));
     }
   }
-  overlay.clear();
+    overlay.clear();
+  } finally {
+    isGenerating = false;
+    currentAbortController = null;
+  }
 }
 
 /* ---------------------------------------------------------------- the call */
 
 const spinFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/** @param {string} text */
-async function ask(text) {
+/**
+ * @param {string} text
+ * @param {Array<{ tag: string, dataUri: string }>} [attachedImages]
+ */
+async function ask(text, attachedImages = []) {
   const startedAt = Date.now();
   const W = termWidth();
   const md = makeRenderer();
@@ -1098,16 +1418,41 @@ async function ask(text) {
   let frame = 0;
   const startSpin = () => {
     if (!TTY || timer !== null) return;
+    isSpinning = true;
+    const inner = Math.max(2, termWidth() - 3);
+    const maxW = inner - 2;
+    const initialText = queuedInput
+      ? `${queuedInput} ${yellow('[queued]')}`
+      : dim('Type to queue next message · Esc to stop');
+    const vLen = stringWidth(initialText);
+    const pad = Math.max(0, maxW - 2 - vLen);
+    const cursorCol = 5 + stringWidth(queuedInput);
+
+    stdout.write('  ' + cyan(spinFrames[frame = 0]) + ' ' + dim('thinking… 0s') + '\n');
+    stdout.write(topRule() + '\n');
+    stdout.write(gray('│') + ' ' + cyan('❯') + ' ' + initialText + ' '.repeat(pad) + gray('│') + '\n');
+    stdout.write(botRule() + '\n');
+    stdout.write(`\x1b[2A\x1b[${cursorCol}G`);
+
     timer = setInterval(() => {
       const s = Math.round((Date.now() - startedAt) / 1000);
-      stdout.write('\r\x1b[K' + '  ' + cyan(spinFrames[frame = (frame + 1) % spinFrames.length]) + ' ' + dim(`thinking… ${s}s`));
+      frame = (frame + 1) % spinFrames.length;
+      const cCol = 5 + stringWidth(queuedInput);
+      stdout.write(`\x1b[2A\r\x1b[K  ${cyan(spinFrames[frame])} ${dim(`thinking… ${s}s`)}\x1b[2B\x1b[${cCol}G`);
     }, 90);
   };
   const stopSpin = () => {
-    if (timer === null) return;
-    clearInterval(timer);
-    timer = null;
-    if (TTY) stdout.write('\r\x1b[K');
+    if (timer === null && !isSpinning) return;
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+    if (isSpinning) {
+      isSpinning = false;
+      if (TTY) {
+        stdout.write('\x1b[2A\r\x1b[J');
+      }
+    }
   };
 
   // Live echo of the raw answer, tracking how many terminal rows it spans so we
@@ -1135,20 +1480,49 @@ async function ask(text) {
     raw = ''; rows = 0; col = 0;
   };
 
+  const messagesContent = attachedImages && attachedImages.length > 0
+    ? [
+        { type: 'text', text },
+        ...attachedImages.map((img) => ({
+          type: 'image_url',
+          image_url: { url: img.dataUri },
+        })),
+      ]
+    : text;
+
+  currentAbortController = new AbortController();
+  isGenerating = true;
+
   const res = await fetch(`${BRIDGE}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: text }] }),
+    body: JSON.stringify({ model, stream: true, messages: [{ role: 'user', content: messagesContent }] }),
+    signal: currentAbortController.signal,
   }).catch((/** @type {unknown} */ err) => {
+    if (currentAbortController?.signal.aborted || (err instanceof Error && (err.name === 'AbortError' || (/** @type {any} */ (err).cause)?.name === 'AbortError'))) return null;
     console.error(red(`\n✗ cannot reach the bridge: ${err instanceof Error ? err.message : String(err)}`));
     return null;
   });
-  if (!res) return;
+  if (!res) {
+    stopSpin();
+    isGenerating = false;
+    currentAbortController = null;
+    return;
+  }
   if (!res.ok) {
+    stopSpin();
+    isGenerating = false;
+    currentAbortController = null;
     console.error(red(`\n✗ bridge returned ${res.status}: ${(await res.text()).slice(0, 300)}`));
     return;
   }
-  if (!res.body) { console.error(red('\n✗ bridge sent no response body')); return; }
+  if (!res.body) {
+    stopSpin();
+    isGenerating = false;
+    currentAbortController = null;
+    console.error(red('\n✗ bridge sent no response body'));
+    return;
+  }
 
   startSpin();
   const reader = res.body.getReader();
@@ -1158,50 +1532,68 @@ async function ask(text) {
   let kind = null;
   let wrote = false;
 
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let cut;
-    while ((cut = buf.indexOf('\n\n')) !== -1) {
-      const frameText = buf.slice(0, cut);
-      buf = buf.slice(cut + 2);
-      const data = frameText.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('');
-      if (!data || data === '[DONE]') continue;
-      /** @type {SSEChunk} */
-      let evt;
-      try { evt = JSON.parse(data); } catch { continue; }
-      if (evt.error) { stopSpin(); reformat(); console.error(red(`\n✗ ${evt.error.message}`)); return; }
-      const delta = evt.choices?.[0]?.delta ?? {};
-
-      if (delta.reasoning_content) {
-        stopSpin();
-        reformat();                        // commit any answer text seen so far
-        renderTool(delta.reasoning_content);
-        kind = 'tool';
-        wrote = true;
-        startSpin();
+  try {
+    for (;;) {
+      let readResult;
+      try {
+        readResult = await reader.read();
+      } catch (err) {
+        if (currentAbortController?.signal.aborted || (err && /** @type {any} */ (err).name === 'AbortError')) {
+          stopSpin();
+          reformat();
+          out('\n  ' + yellow('⏹ response stopped by user'));
+          break;
+        }
+        throw err;
       }
-      if (delta.content) {
-        stopSpin();
-        if (kind === 'tool') out('');      // keep tool blocks and prose apart
-        echo(delta.content);
-        kind = 'answer';
-        wrote = true;
+      const { value, done } = readResult;
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) !== -1) {
+        const frameText = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        const data = frameText.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('');
+        if (!data || data === '[DONE]') continue;
+        /** @type {SSEChunk} */
+        let evt;
+        try { evt = JSON.parse(data); } catch { continue; }
+        if (evt.error) { stopSpin(); reformat(); console.error(red(`\n✗ ${evt.error.message}`)); return; }
+        const delta = evt.choices?.[0]?.delta ?? {};
+
+        if (delta.reasoning_content) {
+          stopSpin();
+          reformat();                        // commit any answer text seen so far
+          renderTool(delta.reasoning_content);
+          kind = 'tool';
+          wrote = true;
+          startSpin();
+        }
+        if (delta.content) {
+          stopSpin();
+          if (kind === 'tool') out('');      // keep tool blocks and prose apart
+          echo(delta.content);
+          kind = 'answer';
+          wrote = true;
+        }
       }
     }
-  }
 
-  stopSpin();
-  reformat();
-  if (!wrote) out(dim('(no reply)'));
-  else if (TTY) out(''); // leave the cursor on a fresh line, not mid-spinner-wipe
+    stopSpin();
+    reformat();
+    if (!wrote) out(dim('(no reply)'));
+    else if (TTY) out(''); // leave the cursor on a fresh line, not mid-spinner-wipe
+  } finally {
+    stopSpin();
+    isGenerating = false;
+    currentAbortController = null;
+  }
 }
 
 /* ---------------------------------------------------------------- pre-flight */
 
 // response.json() is `unknown` under @types/node — assert the shape at the edge.
-const status = /** @type {BridgeStatus | null} */ (
+let status = /** @type {BridgeStatus | null} */ (
   await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null)
 );
 if (!status) {
@@ -1209,6 +1601,15 @@ if (!status) {
   process.exit(1);
 }
 if (!status.extensions) {
+  // Grace period: wait up to 4s in case the extension is reconnecting
+  const graceMs = process.env.NODE_TEST_CONTEXT ? 100 : 4000;
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline && !status?.extensions) {
+    await new Promise((r) => setTimeout(r, 100));
+    status = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch(() => null);
+  }
+}
+if (!status?.extensions) {
   console.error(red('The extension is not connected. Open a https://de.aipass.net/chat tab.'));
   process.exit(1);
 }
@@ -1245,8 +1646,19 @@ async function maybeStartNew(seed) {
 }
 
 if (question) {
+  let initialImages = getAttachedImagesForLine(question);
+  if (imageArg) {
+    const resolved = resolveImagePath(imageArg);
+    if (resolved) {
+      const reg = attachImageFromFile(resolved);
+      if (reg && !initialImages.some((x) => x.id === reg.id)) initialImages.push(reg);
+    } else {
+      console.error(red(`✗ image file not found: ${imageArg}`));
+      process.exit(1);
+    }
+  }
   await maybeStartNew(question);
-  await ask(question);
+  await ask(question, initialImages);
   process.exit(0);
 }
 
@@ -1276,12 +1688,19 @@ const COMMANDS = [
   ['/new',          'start a fresh conversation'],
   ['/agent',        'switch to agent mode — /agent  |  /agent <task> [--allow-run] [--max N]'],
   ['/agent-root',   `set root dir the agent may touch (now: ${agentRoot})`],
+  ['/image',        'attach an image file — /image <path> [prompt]'],
+  ['/clip',         'paste image from clipboard — /clip [prompt]'],
   ['/clear',        'clear the screen'],
   ['/help',         'show this list'],
 ];
 const CMD_PAD = Math.max(...COMMANDS.map(([n]) => n.length));
-const HELP = [...COMMANDS.map(([n, d]) => `  ${n.padEnd(CMD_PAD)}  ${d}`), `  ${'Ctrl+C'.padEnd(CMD_PAD)}  quit`]
-  .map((l) => dim(l)).join('\n');
+const HELP = [
+  ...COMMANDS.map(([n, d]) => `  ${n.padEnd(CMD_PAD)}  ${d}`),
+  `  ${'Ctrl+C'.padEnd(CMD_PAD)}  quit`,
+  '',
+  dim('  Tip: Alt+V (or Ctrl+V) pastes images directly from clipboard.'),
+  dim('  Drag-and-drop image files to automatically attach as [image1].'),
+].map((l) => dim(l)).join('\n');
 
 banner();
 
@@ -1313,7 +1732,8 @@ if (TTY) {
         if (idx === -1) {
           // If a multi-character block with newlines arrived without bracketed markers (raw paste), sanitize it
           if (str.length > 2 && (str.includes('\n') || str.includes('\r'))) {
-            const clean = str.replace(/\r?\n/g, ' ').trimEnd();
+            let clean = str.replace(/\r?\n/g, ' ').trimEnd();
+            clean = processPastedText(clean);
             for (const l of originalListeners) /** @type {any} */ (l).call(stdin, Buffer.from(clean));
             break;
           }
@@ -1332,12 +1752,30 @@ if (TTY) {
           break;
         }
         pasteBuf += str.slice(0, idx);
+        if (pasteBuf === '') {
+          // Empty bracketed paste: terminal may have attempted an image paste without text
+          const reg = attachImageFromClipboard();
+          if (reg) {
+            rl.write(reg.tag + ' ');
+            if (TTY) {
+              stdout.write(`\r\n\x1b[J${dim(`  📎 ${cyan(reg.tag)} attached from clipboard (${(reg.size / 1024).toFixed(1)} KB)`)}\x1b[1A\x1b[${promptCol()}G`);
+            }
+          }
+        }
         // Replace newlines with spaces and trim trailing whitespace so paste stays in input buffer
-        const clean = pasteBuf.replace(/\r?\n/g, ' ').trimEnd();
+        let clean = pasteBuf.replace(/\r?\n/g, ' ').trimEnd();
         pasteBuf = '';
         inPaste = false;
         str = str.slice(idx + 6);
-        for (const l of originalListeners) /** @type {any} */ (l).call(stdin, Buffer.from(clean));
+        if (clean) {
+          clean = processPastedText(clean);
+          if (isGenerating) {
+            queuedInput += clean;
+            updateComposerLine();
+          } else {
+            for (const l of originalListeners) /** @type {any} */ (l).call(stdin, Buffer.from(clean));
+          }
+        }
       }
     }
   });
@@ -1348,14 +1786,6 @@ if (TTY) {
 
 const PROMPT = '❯ ';
 
-// A light frame around the input: a rounded rule above the prompt, a matching
-// one below once the line is submitted. No side bars — readline owns the line
-// width, so we can't reliably close the right edge without redrawing on every
-// keystroke.
-const boxRule = (/** @type {string} */ l, /** @type {string} */ r) =>
-  gray(l + '─'.repeat(Math.max(2, termWidth() - 3)) + r); // full terminal width, -1 col so the corner never wraps
-const topRule = () => boxRule('╭', '╮');
-const botRule = () => boxRule('╰', '╯');
 const hintRule = (/** @type {string} */ sig) => {
   const text = termWidth() >= 70
     ? ` Press ${sig} again to exit (กดอีกครั้งเพื่อออก) `
@@ -1363,6 +1793,60 @@ const hintRule = (/** @type {string} */ sig) => {
   const rem = Math.max(2, termWidth() - 3 - 2 - text.length);
   return gray('╰─') + yellow(text) + gray('─'.repeat(rem) + '╯');
 };
+
+function renderMessageBox(text) {
+  const inner = Math.max(2, termWidth() - 3);
+  const maxW = inner - 2;
+  const outLines = [topRule()];
+
+  for (const raw of text.split('\n')) {
+    if (stringWidth(raw) <= maxW) {
+      const pad = Math.max(0, maxW - stringWidth(raw));
+      outLines.push(gray('│ ') + raw + ' '.repeat(pad) + gray(' │'));
+      continue;
+    }
+    let cur = '';
+    let curW = 0;
+    for (const w of raw.split(/(\s+)/)) {
+      const wW = stringWidth(w);
+      if (curW + wW > maxW) {
+        if (cur.trim()) {
+          const pad = Math.max(0, maxW - stringWidth(cur));
+          outLines.push(gray('│ ') + cur + ' '.repeat(pad) + gray(' │'));
+          cur = '';
+          curW = 0;
+        }
+        if (wW > maxW) {
+          for (const ch of w) {
+            const chW = stringWidth(ch);
+            if (curW + chW > maxW) {
+              const pad = Math.max(0, maxW - stringWidth(cur));
+              outLines.push(gray('│ ') + cur + ' '.repeat(pad) + gray(' │'));
+              cur = ch;
+              curW = chW;
+            } else {
+              cur += ch;
+              curW += chW;
+            }
+          }
+        } else {
+          cur = w;
+          curW = wW;
+        }
+      } else {
+        cur += w;
+        curW += wW;
+      }
+    }
+    if (cur.length > 0) {
+      const pad = Math.max(0, maxW - stringWidth(cur));
+      outLines.push(gray('│ ') + cur + ' '.repeat(pad) + gray(' │'));
+    }
+  }
+
+  outLines.push(botRule());
+  return outLines.join('\n');
+}
 
 /** @type {ReturnType<typeof setTimeout> | null} */
 let exitTimer = null;
@@ -1432,6 +1916,8 @@ function closeMenu() {
   drawBottomFrame();
 }
 
+const MENU_PAGE_SIZE = 5;
+
 /**
  * @param {object} [opts]
  * @param {boolean} [opts.keepSel] keep the current highlight instead of resetting to 0
@@ -1446,13 +1932,27 @@ function drawMenu({ keepSel = false } = {}) {
   if (!keepSel) menuSel = 0;
   if (menuSel >= menuHits.length) menuSel = Math.max(0, menuHits.length - 1);
 
-  /** @type {Array<[string, string]>} */
-  const shown = menuHits.length ? menuHits : [['', 'no matching command']];
-  const rows = shown.map(([name, desc], i) => {
-    const on = menuHits.length > 0 && i === menuSel;
-    const label = name.padEnd(CMD_PAD);
-    return on ? `  ${cyan('›')} ${cyan(label)} ${desc}` : `    ${dim(label)} ${dim(desc)}`;
-  });
+  let start = 0;
+  if (menuHits.length > MENU_PAGE_SIZE) {
+    start = Math.max(0, Math.min(menuSel - Math.floor(MENU_PAGE_SIZE / 2), menuHits.length - MENU_PAGE_SIZE));
+  }
+
+  const rows = [];
+  if (menuHits.length > 0) {
+    rows.push(cyan('  Suggestions') + dim(` (${menuSel + 1}/${menuHits.length})`));
+    const shown = menuHits.slice(start, start + MENU_PAGE_SIZE);
+    for (let i = 0; i < shown.length; i++) {
+      const [name, desc] = shown[i];
+      const realIdx = i + start;
+      const on = realIdx === menuSel;
+      const label = name.padEnd(CMD_PAD);
+      rows.push(on ? `  ${cyan('›')} ${cyan(label)}  ${desc}` : `    ${dim(label)}  ${dim(desc)}`);
+    }
+  } else {
+    rows.push(dim('  Suggestions (0/0)'));
+    rows.push(dim('    no matching command'));
+  }
+
   // Drop below the input line (the terminal scrolls once to make room), wipe
   // whatever was there, print, then climb back and restore the typing column.
   stdout.write(`\r\n\x1b[J${rows.join('\n')}\x1b[${rows.length}A\x1b[${promptCol()}G`);
@@ -1467,6 +1967,44 @@ if (TTY) {
   stdin.on('keypress', (/** @type {string} */ ch, /** @type {import('node:readline').Key} */ key) => {
     const name = key?.name;
 
+    if (isGenerating) {
+      if (name === 'escape') {
+        currentAbortController?.abort();
+        return;
+      }
+      if (key?.ctrl && (name === 'c' || name === 'd')) {
+        currentAbortController?.abort();
+        return;
+      }
+      if (name === 'return') {
+        if (queuedInput.trim()) {
+          promptQueue.push(queuedInput.trim());
+          queuedInput = '';
+          updateComposerLine();
+        }
+        return;
+      }
+      if (name === 'backspace') {
+        queuedInput = queuedInput.slice(0, -1);
+        updateComposerLine();
+        return;
+      }
+      if ((key?.meta && name === 'v') || (key?.ctrl && name === 'v')) {
+        const reg = attachImageFromClipboard();
+        if (reg) {
+          queuedInput += reg.tag + ' ';
+          updateComposerLine();
+        }
+        return;
+      }
+      if (ch && !key?.ctrl && !key?.meta && ch.length === 1) {
+        queuedInput += ch;
+        updateComposerLine();
+        return;
+      }
+      return;
+    }
+
     if (key?.ctrl && name === 'd' && rl.line.length === 0) {
       handleExit('Ctrl+D');
       return;
@@ -1476,6 +2014,24 @@ if (TTY) {
       clearTimeout(exitTimer);
       exitTimer = null;
       drawBottomFrame();
+    }
+
+    // Intercept Alt+V or Ctrl+V for clipboard image pasting
+    if ((key?.meta && name === 'v') || (key?.ctrl && name === 'v')) {
+      const reg = attachImageFromClipboard();
+      if (reg) {
+        rl.write(reg.tag + ' ');
+        if (TTY) {
+          stdout.write(`\r\n\x1b[J${dim(`  📎 ${cyan(reg.tag)} attached from clipboard (${(reg.size / 1024).toFixed(1)} KB)`)}\x1b[1A\x1b[${promptCol()}G`);
+        }
+        return;
+      }
+      if (key?.meta && name === 'v') {
+        if (TTY) {
+          stdout.write(`\r\n\x1b[J${dim('  (no image found in clipboard)')}\x1b[1A\x1b[${promptCol()}G`);
+        }
+        return;
+      }
     }
 
     if (rlKeypressListener) {
@@ -1593,24 +2149,45 @@ for (;;) {
   }
   /** @type {string | typeof CLOSED} */
   let line;
-  try {
-    const p = rl.question((TTY ? '' : '\n') + cyan(PROMPT));
-    if (TTY) drawBottomFrame();
-    line = await Promise.race([p, closed]);
+  if (promptQueue.length > 0) {
+    line = promptQueue.shift() || '';
+    if (TTY && !line.startsWith('/')) {
+      out(renderMessageBox(line));
+    }
+  } else {
+    if (queuedInput) {
+      setLine(queuedInput);
+      queuedInput = '';
+    }
+    try {
+      const p = rl.question((TTY ? '' : '\n') + cyan(PROMPT));
+      if (TTY) drawBottomFrame();
+      line = await Promise.race([p, closed]);
+    }
+    catch {
+      if (TTY) clearInputBox();
+      break;
+    } // Ctrl+C / Ctrl+D
+    if (line === CLOSED) {
+      if (TTY) clearInputBox();
+      break;
+    }
+    if (TTY && menuOpen) { stdout.write('\x1b[J'); menuOpen = false; } // clear the dropdown
+    if (pendingPick) { line = pendingPick; pendingPick = null; }
+    line = line.trim();
+    if (!line) {
+      if (TTY) out(botRule());
+      continue;
+    }
+
+    if (TTY && !line.startsWith('/')) {
+      const promptLines = (line.match(/\n/g) || []).length + 1;
+      stdout.write(`\x1b[${1 + promptLines}A\r\x1b[J`);
+      out(renderMessageBox(line));
+    } else if (TTY) {
+      out(botRule());
+    }
   }
-  catch {
-    if (TTY) clearInputBox();
-    break;
-  } // Ctrl+C / Ctrl+D
-  if (line === CLOSED) {
-    if (TTY) clearInputBox();
-    break;
-  }
-  if (TTY && menuOpen) { stdout.write('\x1b[J'); menuOpen = false; } // clear the dropdown
-  if (TTY) out(botRule()); // close the input frame under the submitted line
-  if (pendingPick) { line = pendingPick; pendingPick = null; }
-  line = line.trim();
-  if (!line) continue;
 
   if (line === '/help') { console.log(HELP); continue; }
 
@@ -1694,6 +2271,82 @@ for (;;) {
     continue;
   }
 
+  if (line === '/clip' || line.startsWith('/clip ')) {
+    const prompt = line.slice(5).trim();
+    const reg = attachImageFromClipboard();
+    if (!reg) {
+      console.log(dim('  no image found in clipboard'));
+      continue;
+    }
+    console.log(dim(`  📎 ${cyan(reg.tag)} attached from clipboard (${(reg.size / 1024).toFixed(1)} KB)`));
+    if (prompt) {
+      const fullText = `${prompt} ${reg.tag}`;
+      if (agentMode) {
+        await runAgentTask(fullText, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply, attachedImages: [reg] });
+      } else {
+        await maybeStartNew(fullText);
+        await ask(fullText, [reg]);
+      }
+      pendingImages.clear();
+      nextImageId = 1;
+    } else {
+      rl.write(reg.tag + ' ');
+    }
+    continue;
+  }
+
+  if (line === '/image' || line.startsWith('/image ')) {
+    const rest = line.slice(6).trim();
+    if (!rest) {
+      console.log(dim('  usage: /image <path/to/image> [prompt]'));
+      continue;
+    }
+    let rawPath = '';
+    let prompt = '';
+    if (rest.startsWith('"') || rest.startsWith("'")) {
+      const q = rest[0];
+      const endQuote = rest.indexOf(q, 1);
+      if (endQuote !== -1) {
+        rawPath = rest.slice(1, endQuote);
+        prompt = rest.slice(endQuote + 1).trim();
+      } else {
+        rawPath = rest;
+      }
+    } else {
+      const spaceIdx = rest.indexOf(' ');
+      if (spaceIdx !== -1) {
+        rawPath = rest.slice(0, spaceIdx);
+        prompt = rest.slice(spaceIdx + 1).trim();
+      } else {
+        rawPath = rest;
+      }
+    }
+
+    const resolved = resolveImagePath(rawPath);
+    if (!resolved) {
+      console.log(red(`  ✗ image not found or unsupported format: ${rawPath}`));
+      continue;
+    }
+    const reg = attachImageFromFile(resolved);
+    if (!reg) continue;
+
+    console.log(dim(`  📎 ${cyan(reg.tag)} attached (${reg.source}, ${(reg.size / 1024).toFixed(1)} KB)`));
+    if (prompt) {
+      const fullText = `${prompt} ${reg.tag}`;
+      if (agentMode) {
+        await runAgentTask(fullText, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply, attachedImages: [reg] });
+      } else {
+        await maybeStartNew(fullText);
+        await ask(fullText, [reg]);
+      }
+      pendingImages.clear();
+      nextImageId = 1;
+    } else {
+      rl.write(reg.tag + ' ');
+    }
+    continue;
+  }
+
   if (line === '/new') {
     pendingNew = true;
     console.log(dim('  next message starts a fresh conversation'));
@@ -1735,8 +2388,7 @@ for (;;) {
       // No task and no flags → toggle mode
       agentMode = !agentMode;
       if (agentMode) {
-        out('');
-        out('  ' + cyan('⬡') + ' ' + bold('switched to agent mode'));
+        out(bold(cyan(`  ⬡ switched to agent mode  (root: ${agentRoot})`)));
         out(dim(`  type a task and press Enter — it will run as an agent loop`));
         out(dim(`  options: --allow-run  --max N  --apply  (persist per mode)`));
         out(dim(`  /agent again to return to chat mode`));
@@ -1761,18 +2413,29 @@ for (;;) {
     const runMaxSteps  = tMaxSteps !== 10 ? tMaxSteps : agentModeMaxSteps;
     out('');
     out(bold(`  🤖 agent  root: ${agentRoot}`) + (runAllowRun ? red('  --allow-run') : ''));
-    await runAgentTask(taskText, { maxSteps: runMaxSteps, allowRun: runAllowRun, autoApply: runAutoApply });
+    const matched = getAttachedImagesForLine(taskText);
+    await runAgentTask(taskText, { maxSteps: runMaxSteps, allowRun: runAllowRun, autoApply: runAutoApply, attachedImages: matched });
+    pendingImages.clear();
+    nextImageId = 1;
     continue;
   }
 
   out();
+  const attached = getAttachedImagesForLine(line);
+  if (attached.length > 0) {
+    const names = attached.map((img) => `${cyan(img.tag)} (${img.source})`).join(', ');
+    out('  ' + dim(`📎 attached: ${names}`));
+  }
+
   // In agent mode, plain messages run as agent tasks instead of chat
   if (agentMode) {
     out(bold(`  🤖 agent  root: ${agentRoot}`) + (agentModeAllowRun ? red('  --allow-run') : ''));
-    await runAgentTask(line, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply });
+    await runAgentTask(line, { maxSteps: agentModeMaxSteps, allowRun: agentModeAllowRun, autoApply: agentModeAutoApply, attachedImages: attached });
   } else {
     await maybeStartNew(line);
-    await ask(line);
+    await ask(line, attached);
   }
+  pendingImages.clear();
+  nextImageId = 1;
 }
 rl.close();

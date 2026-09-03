@@ -97,11 +97,31 @@ function extractModels(decoded) {
 
 const jobs = new Map();
 const extClients = new Set();
+const extClientWaiters = new Set();
 let rr = 0;
 
 const pickClient = () => {
   const list = [...extClients];
   return list.length ? list[rr++ % list.length] : null;
+};
+
+const CONNECT_WAIT_MS = process.env.NODE_TEST_CONTEXT ? 150 : 4000;
+
+const waitForClient = (timeoutMs = CONNECT_WAIT_MS) => {
+  const current = pickClient();
+  if (current) return Promise.resolve(current);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      extClientWaiters.delete(cb);
+      resolve(null);
+    }, timeoutMs);
+    const cb = (client) => {
+      clearTimeout(timer);
+      extClientWaiters.delete(cb);
+      resolve(client);
+    };
+    extClientWaiters.add(cb);
+  });
 };
 
 const sendToClient = (client, event, data) =>
@@ -132,8 +152,9 @@ class Job {
     clearTimeout(this.timer);
     this.timer = setTimeout(() => this.fail('timed out waiting for the extension'), this.timeoutMs);
   }
-  dispatch() {
-    const client = pickClient();
+  async dispatch() {
+    let client = pickClient();
+    if (!client) client = await waitForClient();
     if (!client) return this.fail('no extension connected — open a de.aipass.net tab and check the popup');
     this.client = client;
     sendToClient(client, 'job', this.kind === 'loader'
@@ -201,6 +222,7 @@ let conversationList = [];
 let conversationIndex = 0;
 
 async function loadConversations() {
+  if (!extClients.size) await waitForClient();
   if (!extClients.size) throw new Error('no extension connected — cannot look up a conversation');
   const decoded = decodeTurboStream(await fetchLoader(LOADERS.conversations));
   const list = [];
@@ -532,6 +554,10 @@ function extEvents(req, res) {
   extClients.add(client);
   log(`extension connected (${extClients.size} total)`);
   sendToClient(client, 'ready', { clientId: client.id });
+  for (const waiter of extClientWaiters) {
+    try { waiter(client); } catch { /* ignore */ }
+  }
+  extClientWaiters.clear();
   setTimeout(() => listModels({ force: true }).catch(() => {}), 500);
 
   const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
@@ -680,6 +706,15 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) oaiError(res, 500, String(err?.message ?? err), 'server_error');
     else res.end();
   }
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\x1b[31m✗ Port ${PORT} is already in use.\x1b[0m`);
+    console.error(`  Another bridge process is running. You can kill it with:\n  \x1b[36mfuser -k ${PORT}/tcp\x1b[0m  or  \x1b[36mpkill -f "bridge/server.mjs"\x1b[0m\n`);
+    process.exit(1);
+  }
+  throw err;
 });
 
 server.listen(PORT, HOST, () => {
