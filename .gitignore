@@ -50,3 +50,7 @@ next-env.d.ts
 apipass*.md
 aipass*.md
 *.har
+
+# generated media outputs
+outputs/
+aipass-*.*

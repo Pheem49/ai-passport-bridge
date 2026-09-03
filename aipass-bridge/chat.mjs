@@ -57,7 +57,8 @@ const flag = (name, fallback = null) => {
 
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787') ?? '').replace(/\/+$/, '');
 const CONVERSATION = flag('conversation', null);
-const OUT_DIR = path.resolve(flag('out', process.cwd()) ?? process.cwd());
+const DEFAULT_OUT_DIR = path.join(process.cwd(), 'outputs');
+const OUT_DIR = path.resolve(flag('out', DEFAULT_OUT_DIR) ?? DEFAULT_OUT_DIR);
 const RATIO = flag('ratio', null);
 const RESOLUTION = flag('resolution', null);
 const DURATION = flag('duration', null);
@@ -117,6 +118,7 @@ const extFor = (mime) => {
  * @param {string} label
  */
 const writeMedia = (buf, mime, label) => {
+  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
   const file = path.join(OUT_DIR, `aipass-${Date.now()}-${++saved}.${extFor(mime)}`);
   fs.writeFileSync(file, buf);
   return `\n${cyan(`[${label} saved to ${file}]`)}\n`;
