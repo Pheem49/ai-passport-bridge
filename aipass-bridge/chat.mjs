@@ -185,7 +185,6 @@ const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
 /** @param {string} s */
 const visLen = (s) => stripAnsi(s).length;
 const termWidth = () => stdout.columns || 80;                    // real wrap point
-const termHeight = () => stdout.rows || 24;
 const fmtWidth = () => Math.max(40, Math.min(termWidth(), 100)); // reading width
 /** @param {string} [s] */
 const out = (s = '') => stdout.write(s + '\n');
@@ -1523,7 +1522,7 @@ function agentShowDiff() {
  * @param {string} taskText
  * @param {{ maxSteps?: number, allowRun?: boolean, autoApply?: boolean | null, attachedImages?: Array<{ tag: string, dataUri: string }>, attachedDocuments?: AttachedDocument[] }} [opts]
  */
-async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [], attachedDocuments = [] } = {}) {
+async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApply = null, attachedImages = [], attachedDocuments: _attachedDocuments = [] } = {}) {
   // autoApply: null = ask y/N, true = apply automatically, false = dry run
   overlay.clear();
   const prevAllowRun = agentAllowRun;
