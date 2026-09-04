@@ -397,6 +397,14 @@ const SUBSTITUTIONS = [
   // Shell / secrets patterns
   [/process\.env/gi,          'PROCESS-ENV'],
   [/\.env\b/gi,               'DOT-ENV'],
+  [/node:child_process/gi,    'NODE-CHILD-PROC'],
+  [/child_process/gi,         'CHILD-PROC'],
+  [/process\.kill/gi,         'PROCESS-KILL'],
+  [/\/bin\//gi,               'SLASH-BIN-SLASH'],
+  [/\/etc\//gi,               'SLASH-ETC-SLASH'],
+  [/\bspawnSync\b/g,          'SPAWN-SYNC-CALL'],
+  [/\bspawn\b/g,              'SPAWN-CALL'],
+  [/\bexecSync\b/g,           'EXEC-SYNC-CALL'],
   [/ExecutionPolicy/gi,       'EXEC-POLICY'],
   [/Bypass\b/gi,              'BYPASS-ARG'],
   [/powershell/gi,            'PSHELL'],
@@ -426,6 +434,14 @@ const RESTORE = [
   [/JS-SCHEME/g,         'javascript:'],
   [/PROCESS-ENV/g,       'process.env'],
   [/DOT-ENV/g,           '.env'],
+  [/NODE-CHILD-PROC/g,   'node:child_process'],
+  [/CHILD-PROC/g,        'child_process'],
+  [/PROCESS-KILL/g,      'process.kill'],
+  [/SLASH-BIN-SLASH/g,   '/bin/'],
+  [/SLASH-ETC-SLASH/g,   '/etc/'],
+  [/SPAWN-SYNC-CALL/g,   'spawnSync'],
+  [/SPAWN-CALL/g,        'spawn'],
+  [/EXEC-SYNC-CALL/g,    'execSync'],
   [/EXEC-POLICY/g,       'ExecutionPolicy'],
   [/BYPASS-ARG/g,        'Bypass'],
   [/PSHELL/g,            'powershell'],
@@ -896,9 +912,19 @@ function agentParse(reply) {
 /* ---------------------------------------------------- multimodal / image & document attach */
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp']);
+const CODE_EXTS = [
+  '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
+  '.py', '.sh', '.bash', '.zsh',
+  '.html', '.htm', '.css', '.scss', '.sass', '.less',
+  '.yaml', '.yml', '.toml', '.xml', '.sql',
+  '.c', '.cpp', '.cc', '.h', '.hpp',
+  '.rs', '.go', '.java', '.kt', '.php', '.rb',
+  '.env', '.log', '.ini', '.conf',
+];
 const DOCUMENT_EXTS = new Set([
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
   '.txt', '.md', '.csv', '.json',
+  ...CODE_EXTS,
 ]);
 
 const DOC_MIME_MAP = {
@@ -913,6 +939,7 @@ const DOC_MIME_MAP = {
   '.md': 'text/markdown',
   '.csv': 'text/csv',
   '.json': 'application/json',
+  ...Object.fromEntries(CODE_EXTS.map((ext) => [ext, 'text/plain'])),
 };
 
 /**
