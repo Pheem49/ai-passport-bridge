@@ -25,7 +25,8 @@ window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   const msg = event.data;
   if (!msg || typeof msg !== 'object' || msg[TAG] !== 'res') return;
-  const { [TAG]: _, ...payload } = msg;
+  const payload = { ...msg };
+  delete payload[TAG];
   toWorker(payload);
 });
 

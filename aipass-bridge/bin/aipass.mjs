@@ -17,7 +17,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, openSync, closeSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,7 +27,6 @@ const PORT = process.env.AIPASS_PORT || '8787';
 const BRIDGE = `http://${HOST}:${PORT}`;
 const STATE = join(homedir(), '.aipass');
 const PIDFILE = join(STATE, 'bridge.pid');
-const LOGFILE = join(STATE, 'bridge.log');
 
 const tty = Boolean(process.stdout.isTTY);
 const dim = (s) => (tty ? `\x1b[2m${s}\x1b[0m` : String(s));

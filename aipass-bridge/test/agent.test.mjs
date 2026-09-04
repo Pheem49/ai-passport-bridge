@@ -314,7 +314,7 @@ test('--assistant binds the created conversation and implies slim', async (t) =>
   const ext = await new FakeExtension(bridge.base, { onChat: scripted(['DONE nothing to do']) }).connect();
   t.after(() => ext.disconnect());
 
-  const { out } = await agent(dir, ['--assistant', 'asst_abc123']);
+  await agent(dir, ['--assistant', 'asst_abc123']);
   assert.equal(ext.created.length, 1);
   assert.equal(ext.created[0].assistant, 'asst_abc123', 'the create job carries the assistant id');
   assert.equal(ext.created[0].assistantField, 'aiAssistantId', 'and the configured field name');
