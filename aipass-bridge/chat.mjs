@@ -2363,6 +2363,8 @@ if (TTY) {
 /** @typedef {{ id: string, title?: string, updatedAt?: string }} ConvRow */
 /** @typedef {{ id: string, name?: string, free_credit?: boolean, thinking?: unknown, kind?: string }} ModelRow */
 
+const PICK_PAGE_SIZE = 5;
+
 /**
  * Modal ↑/↓ picker (same interaction as the mockup for /conversations): renders
  * `items`, ↑/↓ moves the cursor, Enter selects, Esc cancels. Takes the keyboard
@@ -2380,19 +2382,28 @@ function pickList(items, { current, label, width }) {
     let painted = 0;
     const longestMain = items.length ? Math.max(...items.map((it) => stringWidth(label(it)[0] || ''))) : 20;
     const mainW = Math.min(fmtWidth() - 20, width ?? Math.max(12, longestMain));
+    const pageSize = Math.min(PICK_PAGE_SIZE, Math.max(3, (stdout.rows || 24) - 4));
 
     const paint = () => {
-      if (painted) stdout.write(`\x1b[${painted}A`);
-      stdout.write('\r\x1b[J');
-      const rows = [dim('  ↑↓ choose · Enter select · Esc cancel')];
-      items.forEach((it, i) => {
+      let start = 0;
+      if (items.length > pageSize) {
+        start = Math.max(0, Math.min(sel - Math.floor(pageSize / 2), items.length - pageSize));
+      }
+      const shown = items.slice(start, start + pageSize);
+
+      const count = items.length > pageSize ? dim(` (${sel + 1}/${items.length})`) : '';
+      const rows = [dim('  ↑↓ choose · Enter select · Esc cancel') + count];
+      shown.forEach((it, idx) => {
+        const i = start + idx;
         const [main, note] = label(it);
         const here = it.id === current ? green('●') : ' ';
         const cur = i === sel ? cyan('›') : ' ';
         const m = truncate(main, mainW).padEnd(mainW);
         rows.push(`  ${cur} ${here} ${i === sel ? cyan(m) : m}  ${dim(note)}`);
       });
-      stdout.write(rows.join('\n') + '\n');
+
+      const wipe = painted ? `\x1b[${painted}A\r\x1b[J` : '\r\x1b[J';
+      stdout.write(wipe + rows.join('\r\n') + '\r\n');
       painted = rows.length;
     };
 
