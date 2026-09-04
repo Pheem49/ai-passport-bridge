@@ -774,6 +774,20 @@ function printUnified(d, ctx = 3) {
 
 function showDiff() {
   if (!overlay.size) { console.log(dim('\nno file changes')); return; }
+  console.log(bold('\nchanges:'));
+  const entries = Array.from(overlay.entries());
+  entries.forEach(([abs, next], idx) => {
+    const rel = path.relative(ROOT, abs);
+    const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+    const diff = lineDiff(before.split('\n'), next === DELETED ? [] : next.split('\n'));
+    const added = diff.filter((d) => d.t === '+').length;
+    const removed = diff.filter((d) => d.t === '-').length;
+    const isLast = idx === entries.length - 1;
+    const branch = isLast ? '└── ' : '├── ';
+    const counts = green(`+${added}`) + ' ' + red(`-${removed}`);
+    const note = next === DELETED ? red(' (deleted)') : !before ? green(' (new file)') : '';
+    console.log(`  ${gray(branch)}${rel}${note} ${dim(`(${counts})`)}`);
+  });
   console.log(bold(`\n${overlay.size} file(s) changed:\n`));
   for (const [abs, next] of overlay) {
     const rel = path.relative(ROOT, abs);
@@ -829,18 +843,31 @@ async function runTask(taskText, { first }) {
 
   let nudges = 0;
   for (let step = 1; step <= MAX_STEPS; step++) {
-    console.log(bold(`\n─── step ${step}/${MAX_STEPS} ${'─'.repeat(40)}`));
+    const stepStart = Date.now();
     let reply;
     try { reply = await sayResilient(next); }
     catch (err) { console.error(red(`\n${err.message}`)); break; }
     reply = inbound(reply); // decode: everything we send is encoded, everything we read is decoded
 
+    const elapsed = ((Date.now() - stepStart) / 1000).toFixed(1);
+    console.log(bold(`\n○ agent step ${step}/${MAX_STEPS}`) + ' ' + dim(`(${elapsed}s)`));
+
+    const proseText = prose(reply);
     const calls = parse(reply);
     const done = calls.find((c) => c.kind === 'done');
     const work = calls.filter((c) => c.kind !== 'done');
 
+    if (proseText) {
+      const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
+      if (firstLine) {
+        const hasMore = work.length > 0 || Boolean(done);
+        const branch = hasMore ? '├── ' : '└── ';
+        console.log(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, 80)}`);
+      }
+    }
+
     if (!work.length) {
-      if (done) { console.log(green(`\n✓ ${done.arg || prose(reply) || 'done'}`)); break; }
+      if (done) { console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`); break; }
       if (++nudges > 2) { console.log(red('\nno marker after three replies — stopping.')); break; }
       console.log(red(`\nno marker in that reply — nudging (${nudges}/2)`));
       next = `I could not tell what to open from that. I have the project open here and I am pasting you whatever you name — nothing happens on your side. ${REMINDER}`;
@@ -849,17 +876,24 @@ async function runTask(taskText, { first }) {
     nudges = 0;
 
     const results = [];
-    for (const call of work) {
+    for (let i = 0; i < work.length; i++) {
+      const call = work[i];
       let result;
       try { result = await TOOLS[call.kind](call.arg, call.body); }
       catch (err) { result = `error: ${err.message}`; }
       const head = String(result).split('\n')[0] ?? '';
-      console.log(`  ${/^(no such|error|the text)/.test(result) ? red('✗') : green('✓')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
+      const ok = !/^(no such|error|the text)/.test(result);
+      const isLast = (i === work.length - 1) && !done;
+      const branch = isLast ? '└── ' : '├── ';
+      console.log(`  ${gray(branch)}${ok ? green('✓') : red('✗')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
       results.push(`Result of ${call.kind} ${call.arg}:\n${outbound(result)}`);
     }
 
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');
-    if (done && !stillLooking) { console.log(green(`\n✓ ${done.arg || prose(reply) || 'done'}`)); break; }
+    if (done && !stillLooking) {
+      console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`);
+      break;
+    }
     if (done) console.log(dim('  (ignoring DONE — it came before the results it asked for)'));
     next = `${results.join('\n\n')}\n\n${REMINDER}`;
     if (step === MAX_STEPS) console.log(red('\nreached the step limit'));

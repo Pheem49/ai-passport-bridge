@@ -94,6 +94,7 @@ const underline = sgr(4);
 const red = sgr(31);
 const green = sgr(32);
 const yellow = sgr(33);
+const magenta = sgr(35);
 const cyan = sgr(36);
 const gray = sgr(90);
 
@@ -1496,22 +1497,54 @@ function printUnified(d, ctx = 3) {
   return shown;
 }
 
+function agentToolBadge(kind) {
+  switch (kind) {
+    case 'search': return cyan('[search]');
+    case 'read':   return cyan('[read]  ');
+    case 'list':   return cyan('[list]  ');
+    case 'glob':   return cyan('[glob]  ');
+    case 'git':    return cyan('[git]   ');
+    case 'fetch':  return cyan('[fetch] ');
+    case 'web':    return cyan('[web]   ');
+    case 'replace': return yellow('[edit]  ');
+    case 'write':   return green('[create]');
+    case 'delete':  return red('[delete]');
+    case 'move':    return yellow('[move]  ');
+    case 'run':     return magenta('[run]   ');
+    default:        return dim(`[${kind}]`);
+  }
+}
+
 function agentShowDiff() {
   if (!overlay.size) { out(dim('  no file changes')); return false; }
   out('');
-  out(bold(`  ${overlay.size} file(s) changed:`));
+  out(bold('changes:'));
+  const entries = Array.from(overlay.entries());
+  entries.forEach(([abs, next], idx) => {
+    const rel = path.relative(agentRoot, abs);
+    const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
+    const diff = lineDiff(before.split('\n'), next === AGENT_DELETED ? [] : next.split('\n'));
+    const added = diff.filter((d) => d.t === '+').length;
+    const removed = diff.filter((d) => d.t === '-').length;
+    const isLast = idx === entries.length - 1;
+    const branch = isLast ? '└── ' : '├── ';
+    const counts = green(`+${added}`) + ' ' + red(`-${removed}`);
+    const note = next === AGENT_DELETED ? red(' (deleted)') : !before ? green(' (new file)') : '';
+    out(`  ${gray(branch)}${rel}${note} ${dim(`(${counts})`)}`);
+  });
+
   for (const [abs, next] of overlay) {
     const rel    = path.relative(agentRoot, abs);
     const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     out('');
     if (next === AGENT_DELETED) {
-      out(bold(`  --- a/${rel}`));
-      out(bold(`  +++ /dev/null (deleted)`));
+      out(bold(`--- a/${rel}`));
+      out(bold(`+++ /dev/null (deleted)`));
       printUnified(lineDiff(before.split('\n'), []));
       continue;
     }
-    out(bold(`  --- a/${rel}${before ? '' : ' (new file)'}`));
-    out(bold(`  +++ b/${rel}`));
+    out(bold(`--- a/${rel}${before ? '' : ' (new file)'}`));
+    out(bold(`+++ b/${rel}`));
     if (!printUnified(lineDiff(before.split('\n'), next.split('\n'))))
       out(dim('  (no textual change)'));
   }
@@ -1552,27 +1585,33 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
 
   let nudges = 0;
   for (let step = 1; step <= maxSteps; step++) {
+    const stepStart = Date.now();
     out('');
-    out(bold(dim(`  ─── agent step ${step}/${maxSteps} ${'─'.repeat(36)}`)));
 
     let reply;
     try { reply = await sayResilient(next, 0, step === 1 ? attachedImages : [], step === 1 ? attachedDocuments : []); }
     catch (err) { out(red(`  ✗ ${/** @type {Error} */ (err).message}`)); break; }
     reply = reply != null ? agentInbound(reply) : '';
 
-    // Render prose (non-marker lines) as markdown
-    const proseText = agentProse(reply);
-    if (proseText) {
-      const md = makeRenderer();
-      for (const l of proseText.split('\n')) md(l);
-    }
+    const elapsed = ((Date.now() - stepStart) / 1000).toFixed(1);
+    out(cyan('○') + ' ' + bold(`agent step ${step}/${maxSteps}`) + ' ' + dim(`(${elapsed}s)`));
 
+    const proseText = agentProse(reply);
     const calls = agentParse(reply);
     const done  = calls.find((c) => c.kind === 'done');
     const work  = calls.filter((c) => c.kind !== 'done');
 
+    if (proseText) {
+      const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
+      if (firstLine) {
+        const hasMore = work.length > 0 || Boolean(done);
+        const branch = hasMore ? '├── ' : '└── ';
+        out(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, fmtWidth() - 16)}`);
+      }
+    }
+
     if (!work.length) {
-      if (done) { out(''); out(green(`  ✓ ${done.arg || proseText || 'done'}`)); break; }
+      if (done) { out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || proseText || 'task complete'}`); break; }
       if (++nudges > 2) { out(red('  no marker after three replies — stopping.')); break; }
       out(red(`  no marker in that reply — nudging (${nudges}/2)`));
       next = `I could not tell what to open from that. I have the project open here and I am pasting you whatever you name — nothing happens on your side. ${AGENT_REMINDER}`;
@@ -1581,18 +1620,42 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     nudges = 0;
 
     const results = [];
-    for (const call of work) {
+    for (let i = 0; i < work.length; i++) {
+      const call = work[i];
       let result;
       try { result = await AGENT_TOOLS[call.kind](call.arg, call.body); }
       catch (err) { result = `error: ${/** @type {Error} */ (err).message}`; }
       const head = String(result).split('\n')[0] ?? '';
       const ok   = !/^(no such|error|the text)/.test(result);
-      out(`  ${ok ? green('✓') : red('✗')} ${dim(call.kind)} ${call.arg}  ${dim(head.slice(0, 70))}`);
+      const isLast = (i === work.length - 1) && !done;
+      const branch = isLast ? '└── ' : '├── ';
+
+      let summary = '';
+      if (call.kind === 'read') {
+        const lineCount = String(result).split('\n').length;
+        summary = `(${lineCount} lines)`;
+      } else if (call.kind === 'search') {
+        const matchCount = String(result).split('\n').filter(Boolean).length;
+        summary = matchCount > 0 ? `(${matchCount} match${matchCount === 1 ? '' : 'es'})` : '(0 matches)';
+      } else if (call.kind === 'replace') {
+        summary = `(modified ${call.arg})`;
+      } else if (call.kind === 'write') {
+        summary = `(created ${call.arg})`;
+      } else if (call.kind === 'delete') {
+        summary = `(deleted ${call.arg})`;
+      } else if (head) {
+        summary = `(${head.slice(0, 50)})`;
+      }
+
+      out(`  ${gray(branch)}${ok ? green('✓') : red('✗')} ${agentToolBadge(call.kind)} ${call.arg ? bold(call.arg) + ' ' : ''}${dim(summary)}`);
       results.push(`Result of ${call.kind} ${call.arg}:\n${agentOutbound(result)}`);
     }
 
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');
-    if (done && !stillLooking) { out(''); out(green(`  ✓ ${done.arg || proseText || 'done'}`)); break; }
+    if (done && !stillLooking) {
+      out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || proseText || 'task complete'}`);
+      break;
+    }
     if (done) out(dim('  (ignoring DONE — it came alongside a tool request)'));
     next = `${results.join('\n\n')}\n\n${AGENT_REMINDER}`;
     if (step === maxSteps) out(red('  reached the step limit'));
@@ -1604,10 +1667,16 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
 
   if (hasChanges) {
     let apply = autoApply;
-    if (apply === null) {
+    while (apply === null) {
       out('');
-      const answer = await rl.question(cyan('  Apply changes to disk? [y/N] '));
-      apply = answer.trim().toLowerCase() === 'y';
+      const answer = (await rl.question(cyan('apply changes? [y/n/d] › '))).trim().toLowerCase();
+      if (answer === 'y' || answer === '') {
+        apply = true;
+      } else if (answer === 'n') {
+        apply = false;
+      } else if (answer === 'd') {
+        agentShowDiff();
+      }
     }
     if (apply) {
       let written = 0;
