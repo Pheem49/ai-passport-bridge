@@ -1524,6 +1524,9 @@ function printUnified(d, ctx = 3) {
   return shown;
 }
 
+/**
+ * @param {string} kind
+ */
 function agentToolBadge(kind) {
   switch (kind) {
     case 'search': return cyan('[search]');
