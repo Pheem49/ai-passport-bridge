@@ -95,6 +95,10 @@ aipass "question" # one-shot answer from CLI
 | `aipass dev` | run the bridge in the foreground (Ctrl+C to stop) |
 | `aipass agent "task"` | file agent against **the current directory** |
 | `aipass models` · `aipass conversations` | the list printers |
+| `aipass styles` | list video & image style presets |
+| `aipass credits` | check credit quota |
+| `aipass doctor` | node / bridge / extension / model diagnostics |
+| `aipass setup-assistant` | configure custom coding assistant |
 | `aipass status` | node / bridge / extension check |
 
 Uninstall with `rm -f ~/.local/bin/aipass` (or `npm rm -g aipass` if you used `npm link`).
@@ -166,6 +170,17 @@ Type `/` to open the command menu — **↑/↓** to choose, **Tab** to fill it 
 | `/models` | print the model list |
 | `/conversations` | switch conversation — an **↑/↓** picker; **Enter** switches, **Esc** cancels |
 | `/new` | the *next* message starts a fresh conversation, titled by that message |
+| `/tone` | set response tone (`concise`, `friendly`, `formal`, etc.) — **↑/↓** picker or `/tone <name>` |
+| `/format` | set response format (`bullet_points`, `table`, `json`, etc.) — **↑/↓** picker or `/format <name>` |
+| `/styles` | print active style settings and all available presets |
+| `/image-style` | pick image style preset (`Anime`, `Cinematic`, etc.) — **↑/↓** picker or `/image-style <name>` |
+| `/video-style` | pick video style preprompt — **↑/↓** picker or `/video-style <name>` |
+| `/credits` | check credit quota & usage meter card (or `/quota`) |
+| `/doctor` | run diagnostic health checks inline |
+| `/assistant` | select custom assistant — **↑/↓** picker, or `/assistant off` |
+| `/agent` | switch to agent mode — `/agent` or `/agent <task>` |
+| `/agent-root` | set directory the agent may touch |
+| `/file` | attach a document or text file — `/file <path> [prompt]` |
 | `/image` | attach local image file — `/image <path> [prompt]` |
 | `/clip` | paste image directly from clipboard — `/clip [prompt]` |
 | `/clear` | clear the screen |
@@ -180,7 +195,11 @@ Type `/` to open the command menu — **↑/↓** to choose, **Tab** to fill it 
 | `npm run agent -- "task" --root .` | local file tools, in a fresh conversation |
 | `npm run agent -- "task" --root . --watch` | stay open for follow-up tasks on the same conversation |
 | `npm run models` | list models, marking free-credit ones |
+| `npm run styles` | list video & image style presets |
 | `npm run conversations` | list conversations and which is in use |
+| `npm run credits` | check credit pool remaining |
+| `npm run doctor` | run comprehensive diagnostic checks |
+| `npm run setup-assistant` | set up or bind custom coding assistant |
 | `npm test` | run the test suite |
 
 `npm run dev:next` still starts the Next.js app in this repo.
@@ -476,7 +495,7 @@ chat. Only the last user message is forwarded.
 npm test
 ```
 
-45 tests, no dependencies, a few seconds. `test/harness.mjs` runs the real
+147 tests, no dependencies, a few seconds. `test/harness.mjs` runs the real
 bridge as a subprocess and a scriptable stand-in for the extension, so tests
 drive the actual HTTP surface and the real CLIs rather than mocks of them.
 

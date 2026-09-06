@@ -5,7 +5,7 @@
 <p align="left">
   <img src="https://img.shields.io/badge/node-%E2%89%A518-blue?logo=node.js&style=flat-square" alt="Node >= 18" />
   <img src="https://img.shields.io/badge/dependencies-zero-success?style=flat-square" alt="Zero Dependencies" />
-  <img src="https://img.shields.io/badge/tests-84%20passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-147%20passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgray?style=flat-square" alt="Platforms" />
 </p>
 
@@ -139,8 +139,12 @@ aipass agent "Run tests" --allow-run   # Allow shell execution (`RUN` commands)
 # Utility & Management
 aipass dev                             # Run bridge in foreground (live logs, Ctrl+C to stop)
 aipass status                          # Check health of Node, Bridge, and Extension
+aipass doctor                          # Run full diagnostics (bridge, extension, models, session)
+aipass credits                         # View account quota & credit usage
 aipass models                          # List available models (free-credit models marked)
+aipass styles                          # List available video & image style presets
 aipass conversations                   # List recent conversations on your account
+aipass setup-assistant                 # Configure or create custom coding assistant
 ```
 
 ---
@@ -161,6 +165,14 @@ While in the interactive `aipass` chat, type `/` to open the interactive command
 | `/thinking` | Open an interactive arrow-key selector to set reasoning thinking level (or `/thinking <level>`) |
 | `/conversations` | Open an arrow-key selector to switch between past conversations |
 | `/new` | Start a fresh conversation with the next message sent |
+| `/tone` | Open an interactive selector to set response tone (`concise`, `friendly`, `formal`, etc.) |
+| `/format` | Open an interactive selector to set response format (`bullet_points`, `table`, `json`, etc.) |
+| `/styles` | View active style settings and available tone, format, image & video presets |
+| `/image-style` | Open an interactive selector to choose image generation style (`Anime`, `Cinematic`, etc.) |
+| `/video-style` | Open an interactive selector to choose video generation style preprompt |
+| `/credits` | Check credit quota and visual usage meter card (or `/quota`) |
+| `/doctor` | Run inline diagnostic checks for bridge, extension, models, and session |
+| `/assistant` | Open an interactive selector to bind to a custom assistant (or `/assistant off`) |
 | `/clear` | Clear the terminal screen |
 | `/help` | Display command help and shortcuts |
 
@@ -236,7 +248,7 @@ This monorepo contains two components:
 │   ├── extension/           # Chrome Manifest V3 extension
 │   ├── chat.mjs             # Interactive TUI chat client
 │   ├── agent.mjs            # Autonomous coding agent loop
-│   ├── test/                # Test suite (84 native Node.js tests)
+│   ├── test/                # Test suite (147 native Node.js tests)
 │   ├── README.md            # Detailed bridge documentation
 │   └── DOCS.md              # In-depth architectural internals
 │
@@ -261,7 +273,7 @@ This monorepo contains two components:
 
 ## 🧪 Testing
 
-Run the comprehensive test suite (84 integration and unit tests covering WAF evasion, streaming, tools, pagination, video/media generation, and CLI edge cases):
+Run the comprehensive test suite (147 integration and unit tests covering WAF evasion, streaming, tools, pagination, video/media generation, assistant bindings, and CLI edge cases):
 
 ```bash
 npm test

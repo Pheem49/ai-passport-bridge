@@ -91,7 +91,11 @@ const HELP = `aipass — de.aipass.net from your terminal
   aipass "question"      one-shot question
   aipass agent "task"    run the file agent against the current directory
   aipass models          list models
+  aipass styles          list video & image style presets
   aipass conversations   list conversations
+  aipass credits         check credit quota
+  aipass doctor          run diagnostics
+  aipass setup-assistant configure custom assistant
   aipass status          check node / bridge / extension status
   aipass stop            stop any lingering background bridge
 
@@ -116,8 +120,19 @@ switch (cmd) {
 
   case 'models':
   case 'conversations':
+  case 'credits':
+  case 'styles':
     await ensureBridge();
-    process.exit(await run('list.mjs', [cmd], { env: { ...process.env, AIPASS_BRIDGE: BRIDGE } }));
+    process.exit(await run('list.mjs', [cmd, ...rest], { env: { ...process.env, AIPASS_BRIDGE: BRIDGE } }));
+    break;
+
+  case 'doctor':
+    process.exit(await run('doctor.mjs', ['--bridge', BRIDGE, ...rest]));
+    break;
+
+  case 'setup-assistant':
+    await ensureBridge();
+    process.exit(await run('setup-assistant.mjs', ['--bridge', BRIDGE, ...rest]));
     break;
 
   case 'status':
