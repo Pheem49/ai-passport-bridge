@@ -1014,17 +1014,21 @@ async function runTask(taskText, { first }) {
     const done = calls.find((c) => c.kind === 'done');
     const work = calls.filter((c) => c.kind !== 'done');
 
-    if (proseText) {
+    if (proseText && work.length > 0) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
-        const hasMore = work.length > 0 || Boolean(done);
-        const branch = hasMore ? '├── ' : '└── ';
-        console.log(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, 80)}`);
+        console.log(`  ${gray('├── ')}${dim('thinking:')} ${truncate(firstLine, 80)}`);
       }
     }
 
     if (!work.length) {
-      if (done) { console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`); break; }
+      if (done) {
+        console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`);
+        if (proseText && done.arg && proseText.trim() !== done.arg.trim()) {
+          console.log('\n' + proseText.trim());
+        }
+        break;
+      }
       if (++nudges > 2) { console.log(red('\nno marker after three replies — stopping.')); break; }
       console.log(red(`\nno marker in that reply — nudging (${nudges}/2)`));
       next = `I could not tell what to open from that. I have the project open here and I am pasting you whatever you name — nothing happens on your side. ${REMINDER}`;
@@ -1050,6 +1054,9 @@ async function runTask(taskText, { first }) {
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');
     if (done && !stillLooking) {
       console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`);
+      if (proseText && done.arg && proseText.trim() !== done.arg.trim()) {
+        console.log('\n' + proseText.trim());
+      }
       break;
     }
     if (done) console.log(dim('  (ignoring DONE — it came before the results it asked for)'));

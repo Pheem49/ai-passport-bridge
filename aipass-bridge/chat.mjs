@@ -1680,17 +1680,23 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     const done  = calls.find((c) => c.kind === 'done');
     const work  = calls.filter((c) => c.kind !== 'done');
 
-    if (proseText) {
+    if (proseText && work.length > 0) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
-        const hasMore = work.length > 0 || Boolean(done);
-        const branch = hasMore ? '├── ' : '└── ';
-        out(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, fmtWidth() - 16)}`);
+        out(`  ${gray('├── ')}${dim('thinking:')} ${truncate(firstLine, fmtWidth() - 16)}`);
       }
     }
 
     if (!work.length) {
-      if (done) { out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || proseText || 'task complete'}`); break; }
+      if (done) {
+        out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || 'task complete'}`);
+        if (proseText && proseText.trim() !== (done.arg || '').trim()) {
+          out('');
+          const md = makeRenderer();
+          for (const l of proseText.split('\n')) md(l);
+        }
+        break;
+      }
       if (++nudges > 2) { out(red('  no marker after three replies — stopping.')); break; }
       out(red(`  no marker in that reply — nudging (${nudges}/2)`));
       next = `I could not tell what to open from that. I have the project open here and I am pasting you whatever you name — nothing happens on your side. ${AGENT_REMINDER}`;
@@ -1732,7 +1738,12 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
 
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');
     if (done && !stillLooking) {
-      out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || proseText || 'task complete'}`);
+      out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || 'task complete'}`);
+      if (proseText && proseText.trim() !== (done.arg || '').trim()) {
+        out('');
+        const md = makeRenderer();
+        for (const l of proseText.split('\n')) md(l);
+      }
       break;
     }
     if (done) out(dim('  (ignoring DONE — it came alongside a tool request)'));
