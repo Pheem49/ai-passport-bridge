@@ -1436,6 +1436,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.on('error', (err) => {
+  if (/** @type {any} */ (err).code === 'EADDRINUSE') {
+    console.error(`\x1b[31m✗ Port ${PORT} is already in use.\x1b[0m`);
+    console.error(`  Another bridge process is running. You can kill it with:\n  \x1b[36mfuser -k ${PORT}/tcp\x1b[0m  or  \x1b[36mpkill -f "bridge/server.mjs"\x1b[0m\n`);
+    process.exit(1);
+  }
+  throw err;
+});
+
 server.listen(PORT, HOST, () => {
   log(`aipass bridge on http://${HOST}:${PORT}`);
   log(`  default model : ${defaultModel}`);

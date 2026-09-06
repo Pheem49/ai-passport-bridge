@@ -55,6 +55,42 @@ const flag = (name, fallback = null) => {
   return i === -1 ? fallback : (argv[i + 1] ?? fallback);
 };
 
+if (argv.includes('--help') || argv.includes('-h')) {
+  console.log(`usage: npm run chat [-- "question"] [options]
+
+  --model ID          model to use          (default: whatever the bridge is set to)
+  --conversation ID   continue a specific conversation
+  --new               start a fresh conversation instead of the most recent
+  --temporary         start a throwaway one, kept out of the chat history
+  --bridge URL        bridge base URL       (default: http://127.0.0.1:8787)
+  --file PATH         attach a document or image; repeat for several
+  --image PATH        attach an image directly
+  --thinking LEVEL    how hard a reasoning model thinks (low, medium, high —
+                      and max on Claude Opus)
+  --ratio R           aspect ratio          (images: 1:1, 3:4, 4:3;
+                      video: 16:9, 9:16, 1:1, 4:3, 3:4, and 21:9 on seedance)
+  --resolution R      video resolution      (480p, 720p — seedance only)
+  --duration N        video length in seconds
+  --camera-fixed      lock the camera for the shot
+  --no-audio          do not generate a soundtrack with the video
+  --style NAME        a video style — name a preset ("Documentary") or pass raw
+                      preprompt text; npm run styles lists them
+  --image-style NAME  an image style preset ("Anime", "อนิเมะ")
+  --tone NAME         concise, detailed, step_by_step, friendly, academic,
+                      storytelling
+  --format NAME       markdown, bullet_points, table, code_block, paragraph,
+                      numbered_list
+  --assistant ID      bind to a custom assistant
+  --out DIR           where to save generated images, video and music
+                                            (default: outputs/)
+  --paste-idle MS     how long to wait before treating pasted lines as one
+                      message                          (default: 60)
+
+With a question, it answers and exits. Without one it stays interactive, where
+/models lists what is available, /model <id> switches, and Ctrl+C quits.`);
+  process.exit(0);
+}
+
 const BRIDGE = (flag('bridge', 'http://127.0.0.1:8787') ?? '').replace(/\/+$/, '');
 const CONVERSATION = flag('conversation', null);
 const DEFAULT_OUT_DIR = path.join(process.cwd(), 'outputs');
@@ -63,11 +99,21 @@ const RATIO = flag('ratio', null);
 const RESOLUTION = flag('resolution', null);
 const DURATION = flag('duration', null);
 const STYLE = flag('style', null);
+const IMAGE_STYLE = flag('image-style', null);
+const TONE = flag('tone', null);
+const FORMAT = flag('format', null);
+const ASSISTANT = flag('assistant', null);
 const CAMERA_FIXED = argv.includes('--camera-fixed');
 const NO_AUDIO = argv.includes('--no-audio');
 const imageArg = flag('image', null);
 const FILES = argv.reduce((/** @type {string[]} */ acc, a, i) => (a === '--file' && argv[i + 1] ? [...acc, argv[i + 1]] : acc), /** @type {string[]} */ ([]));
 let thinkingLevel = flag('thinking', null);
+let activeTone = TONE;
+let activeFormat = FORMAT;
+let activeImageStyle = IMAGE_STYLE;
+let activeVideoStyle = STYLE;
+/** @type {{ id: string, name: string } | null} */
+let activeAssistant = ASSISTANT ? { id: ASSISTANT, name: ASSISTANT } : null;
 // `--new` / `/new` don't create a conversation up front — that would seed the
 // account's chat list with a throwaway "New chat." entry. Instead we defer:
 // the next message the user actually sends becomes the seed, so the entry is
@@ -1858,7 +1904,10 @@ async function ask(text, attachedImages = [], attachedFiles = []) {
       ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
       ...(RESOLUTION ? { resolution: RESOLUTION } : {}),
       ...(DURATION ? { duration: Number(DURATION) } : {}),
-      ...(STYLE ? { style_preprompt: STYLE } : {}),
+      ...(activeVideoStyle ? { style_preprompt: activeVideoStyle } : {}),
+      ...(activeImageStyle ? { image_style: activeImageStyle } : {}),
+      ...(activeTone ? { output_tone: activeTone } : {}),
+      ...(activeFormat ? { output_format: activeFormat } : {}),
       ...(CAMERA_FIXED ? { camera_fixed: true } : {}),
       ...(NO_AUDIO ? { generate_audio: false } : {}),
     }),
@@ -1988,6 +2037,13 @@ if (CONVERSATION) {
   }).catch(() => {});
 }
 
+if (ASSISTANT) {
+  await fetch(`${BRIDGE}/config`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ assistant: ASSISTANT }),
+  }).catch(() => {});
+}
+
 /**
  * If a fresh conversation is pending (`--new` or `/new`), create it now with
  * `seed` as its first message and point the bridge at it. No-op otherwise, so
@@ -2000,7 +2056,11 @@ async function maybeStartNew(seed) {
   const made = /** @type {{ id?: string } | null} */ (
     await fetch(`${BRIDGE}/conversations/new`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model, message: seed }),
+      body: JSON.stringify({
+        model,
+        message: seed,
+        ...(activeAssistant?.id ? { assistant: activeAssistant.id } : {}),
+      }),
     }).then((r) => r.json()).catch(() => null)
   );
   if (made?.id) {
@@ -2061,7 +2121,7 @@ function banner() {
   const w = Math.min(fmtWidth(), 60);
   const inner = w - 2;
   /** @param {string} s */
-  const row = (s) => gray('│') + ' ' + s + ' '.repeat(Math.max(0, inner - 2 - visLen(s))) + gray('│');
+  const row = (s) => gray('│') + ' ' + s + ' '.repeat(Math.max(0, inner - 2 - stringWidth(s))) + gray('│');
   out(gray('╭' + '─'.repeat(inner) + '╮'));
   out(row(bold(cyan('✳ aipass')) + dim('  terminal chat')));
   out(row(''));
@@ -2069,6 +2129,15 @@ function banner() {
   out(row(dim('session  ') + (status?.conversation ?? 'starts on first message')));
   out(row(dim('bridge   ') + BRIDGE.replace(/^https?:\/\//, '')));
   if (thinkingLevel) out(row(dim('thinking ') + cyan(thinkingLevel)));
+  if (activeTone || activeFormat) {
+    const styleParts = [];
+    if (activeTone) styleParts.push(`tone: ${activeTone}`);
+    if (activeFormat) styleParts.push(`format: ${activeFormat}`);
+    out(row(dim('style    ') + magenta(truncate(styleParts.join(', '), inner - 12))));
+  }
+  if (activeImageStyle) out(row(dim('image    ') + magenta(truncate(activeImageStyle, inner - 12))));
+  if (activeVideoStyle) out(row(dim('video    ') + magenta(truncate(activeVideoStyle, inner - 12))));
+  if (activeAssistant) out(row(dim('assistant') + green(truncate(activeAssistant.name || activeAssistant.id, inner - 12))));
   out(gray('╰' + '─'.repeat(inner) + '╯'));
   out(dim('  type /  ·  ↑↓ choose  ·  Tab fill  ·  Enter run  ·  /help  ·  Ctrl+C'));
 }
@@ -2081,6 +2150,14 @@ const COMMANDS = [
   ['/thinking',     'set thinking level — ↑↓ then Enter, or /thinking <level>'],
   ['/conversations','switch conversation — ↑↓ then Enter'],
   ['/new',          'start a fresh conversation'],
+  ['/tone',         'set response tone — ↑↓ then Enter, or /tone <name|off>'],
+  ['/format',       'set response format — ↑↓ then Enter, or /format <name|off>'],
+  ['/styles',       'show available tone, format, image & video presets'],
+  ['/image-style',  'pick image generation style — ↑↓ then Enter, or /image-style <name|off>'],
+  ['/video-style',  'pick video generation style — ↑↓ then Enter, or /video-style <name|off>'],
+  ['/credits',      'check credit quota & usage meter'],
+  ['/doctor',       'run diagnostic checks for bridge, extension & models'],
+  ['/assistant',    'select custom assistant — ↑↓ then Enter, or /assistant off'],
   ['/agent',        'switch to agent mode — /agent  |  /agent <task> [--allow-run] [--max N]'],
   ['/agent-root',   `set root dir the agent may touch (now: ${agentRoot})`],
   ['/file',         'attach a document — /file <path> [prompt] (PDF, Word, Excel, CSV, text)'],
@@ -2845,6 +2922,414 @@ for (;;) {
   if (line === '/new') {
     pendingNew = true;
     console.log(dim('  next message starts a fresh conversation'));
+    continue;
+  }
+
+  // `/tone` on its own opens an ↑/↓ picker; `/tone <name|off>` sets directly.
+  if (line === '/tone' || line.startsWith('/tone ')) {
+    const rawVal = line === '/tone' ? '' : line.slice(5).trim().toLowerCase();
+    if (!rawVal) {
+      const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
+      /** @type {Array<{ id: string, label?: string, note?: string }>} */
+      const items = [
+        { id: 'off', label: 'off', note: 'default AI tone' },
+      ];
+      if (bridgeOpts?.tones?.length) {
+        for (const t of bridgeOpts.tones) {
+          items.push({
+            id: t.code,
+            label: t.code,
+            note: t.nameTh ? `${t.name} (${t.nameTh})` : (t.name || ''),
+          });
+        }
+      } else {
+        items.push(
+          { id: 'concise', label: 'concise', note: 'brief, direct, no fluff' },
+          { id: 'friendly', label: 'friendly', note: 'warm, welcoming, conversational' },
+          { id: 'formal', label: 'formal', note: 'professional, structured, polite' },
+          { id: 'persuasive', label: 'persuasive', note: 'compelling, motivating' },
+          { id: 'casual', label: 'casual', note: 'relaxed, approachable' },
+          { id: 'empathetic', label: 'empathetic', note: 'supportive, understanding' },
+          { id: 'academic', label: 'academic', note: 'scholarly, analytical' },
+          { id: 'storytelling', label: 'storytelling', note: 'narrative, vivid' },
+        );
+      }
+      if (!TTY) {
+        for (const t of items) console.log(`  ${t.id === (activeTone || 'off') ? '●' : ' '} ${t.id.padEnd(14)} ${dim(t.note ?? '')}`);
+        continue;
+      }
+      const chosen = await pickList(items, {
+        current: activeTone || 'off',
+        label: (t) => [t.label || t.id, t.note || ''],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      activeTone = chosen.id === 'off' ? null : chosen.id;
+    } else {
+      activeTone = (rawVal === 'off' || rawVal === 'none') ? null : rawVal;
+    }
+    console.log(dim(`  tone → ${activeTone ? magenta(activeTone) : 'off'}`));
+    continue;
+  }
+
+  // `/format` on its own opens an ↑/↓ picker; `/format <name|off>` sets directly.
+  if (line === '/format' || line.startsWith('/format ')) {
+    const rawVal = line === '/format' ? '' : line.slice(7).trim().toLowerCase();
+    if (!rawVal) {
+      const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
+      /** @type {Array<{ id: string, label?: string, note?: string }>} */
+      const items = [
+        { id: 'off', label: 'off', note: 'standard free-form output' },
+      ];
+      if (bridgeOpts?.formats?.length) {
+        for (const f of bridgeOpts.formats) {
+          items.push({
+            id: f.code,
+            label: f.code,
+            note: f.nameTh ? `${f.name} (${f.nameTh})` : (f.name || ''),
+          });
+        }
+      } else {
+        items.push(
+          { id: 'bullet_points', label: 'bullet_points', note: 'clean bulleted lists' },
+          { id: 'table', label: 'table', note: 'structured markdown tables' },
+          { id: 'step_by_step', label: 'step_by_step', note: 'numbered sequential steps' },
+          { id: 'json', label: 'json', note: 'raw valid JSON payload' },
+          { id: 'paragraphs', label: 'paragraphs', note: 'flowing descriptive prose' },
+          { id: 'markdown', label: 'markdown', note: 'rich markdown with headers' },
+          { id: 'code_block', label: 'code_block', note: 'fenced code block response' },
+        );
+      }
+      if (!TTY) {
+        for (const f of items) console.log(`  ${f.id === (activeFormat || 'off') ? '●' : ' '} ${f.id.padEnd(16)} ${dim(f.note ?? '')}`);
+        continue;
+      }
+      const chosen = await pickList(items, {
+        current: activeFormat || 'off',
+        label: (f) => [f.label || f.id, f.note || ''],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      activeFormat = chosen.id === 'off' ? null : chosen.id;
+    } else {
+      activeFormat = (rawVal === 'off' || rawVal === 'none') ? null : rawVal;
+    }
+    console.log(dim(`  format → ${activeFormat ? magenta(activeFormat) : 'off'}`));
+    continue;
+  }
+
+  // `/styles` prints current style status and available preset options
+  if (line === '/styles') {
+    const styleRes = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
+    const videoRes = await fetch(`${BRIDGE}/video-options`).then((r) => r.json()).catch(() => null);
+
+    console.log(bold('\n  Current Active Styles:'));
+    console.log(`    Tone:        ${activeTone ? magenta(activeTone) : dim('off')}   ${dim('(/tone <name|off>)')}`);
+    console.log(`    Format:      ${activeFormat ? magenta(activeFormat) : dim('off')}   ${dim('(/format <name|off>)')}`);
+    console.log(`    Image Style: ${activeImageStyle ? magenta(activeImageStyle) : dim('off')}   ${dim('(/image-style <name|off>)')}`);
+    console.log(`    Video Style: ${activeVideoStyle ? magenta(activeVideoStyle) : dim('off')}   ${dim('(/video-style <name|off>)')}`);
+
+    if (styleRes?.tones?.length) {
+      console.log(bold('\n  Available Tones:'));
+      console.log('    ' + styleRes.tones.map((/** @type {any} */ t) => cyan(t.code) + (t.nameTh ? dim(` (${t.nameTh})`) : '')).join(', '));
+    }
+    if (styleRes?.formats?.length) {
+      console.log(bold('\n  Available Formats:'));
+      console.log('    ' + styleRes.formats.map((/** @type {any} */ f) => cyan(f.code) + (f.nameTh ? dim(` (${f.nameTh})`) : '')).join(', '));
+    }
+    if (styleRes?.imageStyles?.length) {
+      console.log(bold('\n  Image Style Presets:'));
+      console.log('    ' + styleRes.imageStyles.slice(0, 15).map((/** @type {any} */ s) => cyan(s.name || s.id)).join(', ') + (styleRes.imageStyles.length > 15 ? dim(` …+${styleRes.imageStyles.length - 15} more`) : ''));
+    }
+    if (videoRes?.styles?.length) {
+      console.log(bold('\n  Video Style Presets:'));
+      console.log('    ' + videoRes.styles.map((/** @type {any} */ s) => cyan(s.name)).join(', '));
+    }
+    console.log();
+    continue;
+  }
+
+  // `/image-style` on its own opens an ↑/↓ picker; `/image-style <name|off>` sets directly.
+  if (line === '/image-style' || line.startsWith('/image-style ')) {
+    const rawVal = line === '/image-style' ? '' : line.slice(12).trim();
+    if (!rawVal) {
+      const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
+      /** @type {Array<{ id: string, label?: string, note?: string }>} */
+      const items = [
+        { id: 'off', label: 'off', note: 'default prompt (no style preset)' },
+      ];
+      if (bridgeOpts?.imageStyles?.length) {
+        for (const s of bridgeOpts.imageStyles) {
+          items.push({
+            id: s.id,
+            label: s.name || s.id,
+            note: s.nameTh ? `${s.nameTh} · id: ${s.id}` : `id: ${s.id}`,
+          });
+        }
+      } else {
+        const fallbacks = [
+          { id: 'anime', label: 'Anime', note: 'อนิเมะ' },
+          { id: 'photorealistic', label: 'Photorealistic', note: 'ภาพถ่ายสมจริง' },
+          { id: 'cinematic', label: 'Cinematic', note: 'ภาพยนตร์' },
+          { id: 'fantasy', label: 'Fantasy Art', note: 'แฟนตาซี' },
+          { id: 'oil_painting', label: 'Oil Painting', note: 'ภาพวาดสีน้ำมัน' },
+          { id: 'watercolor', label: 'Watercolor', note: 'ภาพวาดสีน้ำ' },
+          { id: 'cyberpunk', label: 'Cyberpunk', note: 'ไซเบอร์พังก์' },
+          { id: 'pixel_art', label: 'Pixel Art', note: 'พิกเซลอาร์ต' },
+          { id: '3d_render', label: '3D Render', note: 'โมเดล 3D' },
+        ];
+        for (const f of fallbacks) items.push(f);
+      }
+      if (!TTY) {
+        for (const s of items) console.log(`  ${s.id === (activeImageStyle || 'off') ? '●' : ' '} ${(s.label || s.id).padEnd(18)} ${dim(s.note ?? '')}`);
+        continue;
+      }
+      const chosen = await pickList(items, {
+        current: activeImageStyle || 'off',
+        label: (s) => [s.label || s.id, s.note || ''],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      activeImageStyle = chosen.id === 'off' ? null : chosen.id;
+    } else {
+      activeImageStyle = (rawVal.toLowerCase() === 'off' || rawVal.toLowerCase() === 'none') ? null : rawVal;
+    }
+    console.log(dim(`  image-style → ${activeImageStyle ? magenta(activeImageStyle) : 'off'}`));
+    continue;
+  }
+
+  // `/video-style` on its own opens an ↑/↓ picker; `/video-style <name|off>` sets directly.
+  if (line === '/video-style' || line.startsWith('/video-style ')) {
+    const rawVal = line === '/video-style' ? '' : line.slice(12).trim();
+    if (!rawVal) {
+      const bridgeOpts = await fetch(`${BRIDGE}/video-options`).then((r) => r.json()).catch(() => null);
+      /** @type {Array<{ id: string, label?: string, note?: string }>} */
+      const items = [
+        { id: 'off', label: 'off', note: 'no style preprompt' },
+      ];
+      if (bridgeOpts?.styles?.length) {
+        for (const s of bridgeOpts.styles) {
+          items.push({
+            id: s.name,
+            label: s.name,
+            note: s.nameTh ? `${s.nameTh} · ${s.preprompt?.slice(0, 30)}…` : (s.preprompt?.slice(0, 40) || ''),
+          });
+        }
+      } else {
+        const fallbacks = [
+          { id: 'Cinematic', label: 'Cinematic', note: 'movie lighting, shallow depth of field' },
+          { id: 'Animation', label: 'Animation', note: '3D animated movie look' },
+          { id: 'Anime', label: 'Anime', note: 'Japanese animation visual aesthetic' },
+          { id: 'Documentary', label: 'Documentary', note: 'realistic footage, natural light' },
+          { id: 'Vintage', label: 'Vintage', note: '80s/90s analog film stock grain' },
+          { id: 'Cyberpunk', label: 'Cyberpunk', note: 'neon reflections, dark moody tech' },
+        ];
+        for (const f of fallbacks) items.push(f);
+      }
+      if (!TTY) {
+        for (const s of items) console.log(`  ${s.id === (activeVideoStyle || 'off') ? '●' : ' '} ${(s.label || s.id).padEnd(16)} ${dim(s.note ?? '')}`);
+        continue;
+      }
+      const chosen = await pickList(items, {
+        current: activeVideoStyle || 'off',
+        label: (s) => [s.label || s.id, s.note || ''],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      activeVideoStyle = chosen.id === 'off' ? null : chosen.id;
+    } else {
+      activeVideoStyle = (rawVal.toLowerCase() === 'off' || rawVal.toLowerCase() === 'none') ? null : rawVal;
+    }
+    console.log(dim(`  video-style → ${activeVideoStyle ? magenta(activeVideoStyle) : 'off'}`));
+    continue;
+  }
+
+  // `/credits` or `/quota` displays an aesthetic credit and quota meter card
+  if (line === '/credits' || line === '/quota') {
+    const quota = await fetch(`${BRIDGE}/quota`).then((r) => r.json()).catch(() => null);
+    if (!quota || quota.error || typeof quota.available !== 'number') {
+      console.log(red('  ✗ could not fetch credit figures from bridge'));
+      console.log(dim('    make sure the bridge is running and a https://de.aipass.net/chat tab is open'));
+      continue;
+    }
+    const { limit = 0, used = 0, available = 0, periodEndsAt, video } = quota;
+    const total = limit || (used + available) || 1;
+    const pct = Math.min(100, Math.max(0, Math.round((available / total) * 100)));
+    const usedPct = 100 - pct;
+    const barWidth = 20;
+    const filledLen = Math.min(barWidth, Math.round((usedPct / 100) * barWidth));
+    const emptyLen = Math.max(0, barWidth - filledLen);
+    const barColor = pct > 25 ? green : pct > 10 ? yellow : red;
+    const meter = barColor('█'.repeat(filledLen)) + dim('░'.repeat(emptyLen));
+
+    const n = (/** @type {number} */ v) => v.toLocaleString('en-US', { maximumFractionDigits: v < 100 ? 1 : 0 });
+    const fmtDate = (/** @type {string | null | undefined} */ d) => {
+      if (!d) return 'unknown';
+      try { return new Date(d).toLocaleString(); } catch { return String(d); }
+    };
+
+    console.log();
+    console.log(gray('  ╭──────────────────────────────────────────────────╮'));
+    console.log(gray('  │ ') + bold(cyan('💳 aipass credits & quota')) + ' '.repeat(25) + gray('│'));
+    console.log(gray('  │') + ' '.repeat(50) + gray('│'));
+    console.log(gray('  │ ') + `Usage:      [${meter}] ${String(usedPct).padStart(3)}% used` + ' '.repeat(6) + gray('│'));
+    console.log(gray('  │ ') + `Available:  ${barColor(n(available))} / ${n(total)} credits (${pct}% left)`.padEnd(58) + gray('│'));
+    if (periodEndsAt) {
+      console.log(gray('  │ ') + dim(`Resets at:  ${fmtDate(periodEndsAt)}`).padEnd(58) + gray('│'));
+    }
+    if (video) {
+      const vRem = video.remaining ?? (video.limit - video.used);
+      console.log(gray('  │ ') + `Video:      ${video.used ?? 0} / ${video.limit ?? 0} used (${vRem} left)`.padEnd(49) + gray('│'));
+    }
+    console.log(gray('  ╰──────────────────────────────────────────────────╯\n'));
+    continue;
+  }
+
+  // `/doctor` runs diagnostic health checks
+  if (line === '/doctor') {
+    console.log(bold('\n  🩺 Running inline diagnostics…\n'));
+    const getEndpoint = (/** @type {string} */ p) =>
+      fetch(`${BRIDGE}${p}`).then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json().catch(() => null) })).catch(() => ({ ok: false, status: 0, body: null }));
+
+    // 1. Bridge check
+    const stRes = await getEndpoint('/status');
+    if (stRes.ok && stRes.body) {
+      console.log(`  ${green('✓')} ${bold('bridge'.padEnd(14))} responding at ${BRIDGE}`);
+    } else {
+      console.log(`  ${red('✗')} ${bold('bridge'.padEnd(14))} not reachable (run: npm run dev)`);
+      continue;
+    }
+
+    // 2. Extension check
+    const extCount = stRes.body.extensions ?? 0;
+    if (extCount > 0) {
+      console.log(`  ${green('✓')} ${bold('extension'.padEnd(14))} ${extCount} browser tab${extCount > 1 ? 's' : ''} connected`);
+    } else {
+      console.log(`  ${red('✗')} ${bold('extension'.padEnd(14))} no tab connected (open https://de.aipass.net/chat)`);
+    }
+
+    // 3. Models check
+    const modRes = await getEndpoint('/v1/models');
+    const mList = modRes.body?.data ?? [];
+    const hasReal = mList.some((/** @type {any} */ m) => m.owned_by && m.owned_by !== 'aipass');
+    if (hasReal) {
+      console.log(`  ${green('✓')} ${bold('models'.padEnd(14))} signed in — ${mList.length} models available`);
+    } else if (mList.length > 0) {
+      console.log(`  ${yellow('!')} ${bold('models'.padEnd(14))} ${mList.length} fallback models (check login at de.aipass.net)`);
+    } else {
+      console.log(`  ${red('✗')} ${bold('models'.padEnd(14))} failed to load models`);
+    }
+
+    // 4. Credits check
+    const qRes = await getEndpoint('/quota');
+    if (qRes.ok && qRes.body?.limit) {
+      const q = qRes.body;
+      const pct = Math.round((q.available / q.limit) * 100);
+      const mark = pct <= 10 ? yellow('!') : green('✓');
+      console.log(`  ${mark} ${bold('credits'.padEnd(14))} ${q.available.toFixed(1)} / ${q.limit.toFixed(0)} left (${pct}%)`);
+    } else {
+      console.log(`  ${yellow('!')} ${bold('credits'.padEnd(14))} could not read quota (open tab to refresh)`);
+    }
+
+    // 5. Conversations check
+    const convRes = await getEndpoint('/conversations');
+    const cList = convRes.body?.conversations ?? [];
+    if (convRes.ok && (convRes.body?.current || cList.length)) {
+      console.log(`  ${green('✓')} ${bold('session'.padEnd(14))} current: ${convRes.body.current || cList[0]?.id || 'active'} (${cList.length} total)`);
+    } else {
+      console.log(`  ${dim('–')} ${bold('session'.padEnd(14))} starts on first message or /new`);
+    }
+
+    console.log();
+    continue;
+  }
+
+  // `/assistant` on its own opens an ↑/↓ picker; `/assistant off` detaches; `/assistant <id>` binds directly.
+  if (line === '/assistant' || line.startsWith('/assistant ')) {
+    const rawVal = line === '/assistant' ? '' : line.slice(10).trim();
+    if (rawVal.toLowerCase() === 'off' || rawVal.toLowerCase() === 'none') {
+      activeAssistant = null;
+      await fetch(`${BRIDGE}/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assistant: '' }),
+      }).catch(() => {});
+      console.log(dim('  assistant detached'));
+      continue;
+    }
+
+    if (!rawVal) {
+      const r = /** @type {{ assistants?: Array<{ id: string, name: string, model?: string }> } | null} */ (
+        await fetch(`${BRIDGE}/assistants`).then((x) => x.json()).catch(() => null)
+      );
+      const all = r?.assistants ?? [];
+      /** @type {Array<{ id: string, name?: string, note?: string }>} */
+      const items = [
+        { id: 'off', name: 'off', note: 'detach custom assistant' },
+      ];
+      for (const a of all) {
+        items.push({
+          id: a.id,
+          name: a.name || a.id,
+          note: a.model ? `model: ${a.model}` : a.id,
+        });
+      }
+
+      if (!all.length) {
+        console.log(dim('  no custom assistants found on your aipass account'));
+        console.log(dim('  create one at https://de.aipass.net or via assistant setup'));
+        continue;
+      }
+
+      if (!TTY) {
+        for (const a of items) console.log(`  ${a.id === (activeAssistant?.id || 'off') ? '●' : ' '} ${(a.name || a.id).padEnd(20)} ${dim(a.note ?? '')}`);
+        continue;
+      }
+
+      const chosen = await pickList(items, {
+        current: activeAssistant?.id || 'off',
+        label: (a) => [a.name || a.id, a.note || ''],
+      });
+      if (!chosen) { console.log(dim('  cancelled')); continue; }
+      if (chosen.id === 'off') {
+        activeAssistant = null;
+        await fetch(`${BRIDGE}/config`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ assistant: '' }),
+        }).catch(() => {});
+        console.log(dim('  assistant detached'));
+        continue;
+      }
+
+      const bindRes = await fetch(`${BRIDGE}/assistants/${encodeURIComponent(chosen.id)}/chat`, { method: 'POST' })
+        .then((x) => x.json()).catch(() => null);
+      if (bindRes?.conversation) {
+        if (status) status.conversation = bindRes.conversation;
+        pendingNew = false;
+        activeAssistant = { id: chosen.id, name: chosen.name || chosen.id };
+        console.log(green(`  assistant attached → ${activeAssistant.name}`) + dim(` (${chosen.id})`));
+        console.log(dim(`  conversation → ${bindRes.conversation}`));
+      } else {
+        await fetch(`${BRIDGE}/config`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ assistant: chosen.id }),
+        }).catch(() => {});
+        activeAssistant = { id: chosen.id, name: chosen.name || chosen.id };
+        console.log(green(`  assistant set → ${activeAssistant.name}`));
+      }
+      continue;
+    }
+
+    const bindRes = await fetch(`${BRIDGE}/assistants/${encodeURIComponent(rawVal)}/chat`, { method: 'POST' })
+      .then((x) => x.json()).catch(() => null);
+    if (bindRes?.conversation) {
+      if (status) status.conversation = bindRes.conversation;
+      pendingNew = false;
+      activeAssistant = { id: rawVal, name: rawVal };
+      console.log(green(`  assistant attached → ${rawVal}`) + dim(` (session: ${bindRes.conversation})`));
+    } else {
+      await fetch(`${BRIDGE}/config`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ assistant: rawVal }),
+      }).catch(() => {});
+      activeAssistant = { id: rawVal, name: rawVal };
+      console.log(green(`  assistant set → ${rawVal}`));
+    }
     continue;
   }
 

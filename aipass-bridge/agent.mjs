@@ -34,6 +34,10 @@ const CONVERSATION = flag('conversation', null);
 // A conversation carries its own history, so reusing one drags in whatever was
 // said before — including any refusal. Each run gets a fresh one by default.
 const REUSE = has('reuse');
+// A run gets a throwaway conversation by default: it never enters the account's
+// chat history, cannot inherit anything said in an earlier run, and expires on
+// its own. --permanent keeps the old behaviour of a normal saved conversation.
+const PERMANENT = has('permanent');
 // When the conversation is bound to a custom aipass assistant that already
 // carries the NEED/EDIT/CREATE/DONE instructions, the preamble is redundant —
 // and sending it again is just extra payload for the edge to inspect.
@@ -46,16 +50,31 @@ const WATCH = has('watch');
 // pass the id through. Implies --slim, since the assistant carries the protocol.
 const ASSISTANT = flag('assistant', process.env.AIPASS_ASSISTANT_ID || null);
 
-if (!task) {
-  console.error(`usage: npm run agent -- "<task>" [options]
+const HELP = has('help') || argv.includes('-h');
+
+if (!task || HELP) {
+  // Asking for help is not an error, so it leaves with 0; a missing task is.
+  const out = HELP ? console.log : console.error;
+  out(`usage: npm run agent -- "<task>" [options]
 
   --root DIR      project root the agent may touch   (default: cwd)
   --model ID      model id                           (default: bridge default)
-  --apply         write changes to disk              (default: dry run)
+  --apply         write without asking               (default: ask after the diff)
   --allow-run     let the agent run shell commands   (default: off)
   --max N         max steps                          (default: 10)
-  --max-result N  truncate each tool result          (default: 6000 bytes)`);
-  process.exit(1);
+  --max-result N  truncate each tool result          (default: 3000 bytes)
+  --read-lines N  max lines per read page            (default: 250)
+  --file PATH     attach a document or image to the session
+  --slim          send only the task, without the built-in preamble
+  --watch         stay open for follow-up tasks on the same conversation
+  --reuse         continue the most recent conversation instead of a new one
+  --permanent     keep the conversation in your chat history (default: temporary)
+  --assistant ID  bind to a custom aipass assistant  (or AIPASS_ASSISTANT_ID)
+  --bridge URL    bridge base URL                    (default: http://127.0.0.1:8787)
+
+The model receives a tool protocol on turn 1 and drives file edits directly.
+A dry run prints a unified diff; reply 'y' or pass --apply to write it to disk.`);
+  process.exit(HELP ? 0 : 1);
 }
 
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
@@ -118,7 +137,7 @@ const existsAt = (abs) => {
 const SKIP = new Set(['node_modules', '.git', '.next', 'dist', 'build', '.cache']);
 
 const clip = (s) => (s.length > MAX_RESULT ? `${s.slice(0, MAX_RESULT)}\n… truncated` : s);
-const READ_LINES = Number(flag('read-lines', 200));
+const READ_LINES = Number(flag('read-lines', 250));
 
 // read() shows a line-number gutter so the model can reference ranges. Those
 // numbers are display only; strip them off a FIND block in case the model
@@ -227,13 +246,60 @@ const RESTORE = [
 
 const inbound = (text) => (text == null ? text : RESTORE.reduce((acc, [re, to]) => acc.replace(re, to), text));
 
+// Binary file magic signatures, checked on NEED file. Trying to read binary
+// content as UTF-8 costs a whole run of the model trying to make sense of
+// mojibake — refuse up front by signature or by NUL byte, and tell the user
+// how to attach it to a chat instead.
+const MAGIC = [
+  ['PDF', (b) => b.subarray(0, 4).toString('latin1') === '%PDF'],
+  ['a zip-based document (docx, xlsx, pptx)', (b) => b.subarray(0, 4).toString('latin1') === 'PK\x03\x04'],
+  ['PNG', (b) => b.subarray(1, 4).toString('latin1') === 'PNG'],
+  ['JPEG', (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff],
+  ['GIF', (b) => b.subarray(0, 3).toString('latin1') === 'GIF'],
+  ['gzip', (b) => b[0] === 0x1f && b[1] === 0x8b],
+  ['MP4 or MOV', (b) => b.subarray(4, 8).toString('latin1') === 'ftyp'],
+  ['RIFF media (wav, avi, webp)', (b) => b.subarray(0, 4).toString('latin1') === 'RIFF'],
+  ['Ogg', (b) => b.subarray(0, 4).toString('latin1') === 'OggS'],
+  ['MP3', (b) => b.subarray(0, 3).toString('latin1') === 'ID3'],
+  ['a compiled binary', (b) => b.subarray(1, 4).toString('latin1') === 'ELF'],
+];
+
+function binaryKind(abs) {
+  if (overlay.has(abs)) return null; // written by the agent this run, so text
+  let fd;
+  try {
+    fd = fs.openSync(abs, 'r');
+    const buf = Buffer.alloc(4096);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    const head = buf.subarray(0, n);
+    for (const [name, test] of MAGIC) if (test(head)) return name;
+    // Nothing recognised it, so fall back to the oldest test there is.
+    return head.includes(0) ? 'binary' : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+  }
+}
+
 const TOOLS = {
   list(arg) {
     const abs = safe(arg || '.');
-    return clip(fs.readdirSync(abs, { withFileTypes: true })
-      .filter((e) => !SKIP.has(e.name))
-      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-      .sort().join('\n') || '(empty)');
+    const names = new Set(
+      (fs.existsSync(abs) ? fs.readdirSync(abs, { withFileTypes: true }) : [])
+        .filter((e) => !SKIP.has(e.name))
+        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name)));
+    // A file the agent has written this run is readable by `read` and reported
+    // by `exists`, so a listing that omits it tells the model its own write
+    // failed. It then re-creates the file, doubts the tools, and eventually
+    // concludes it cannot reach the filesystem at all — issue #32.
+    for (const pending of overlay.keys()) {
+      const rel = path.relative(abs, pending);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      const [first, ...rest] = rel.split(path.sep);
+      names.add(rest.length ? `${first}/` : first);
+    }
+    return clip([...names].sort().join('\n') || '(empty)');
   },
   read(arg) {
     // Accept an optional trailing line range, e.g. `NEED file src/app.ts 200-320`.
@@ -246,6 +312,13 @@ const TOOLS = {
     const rel = parts.join(' ');
     const abs = safe(rel);
     if (!existsAt(abs)) return `no such file: ${rel}`;
+    const kind = binaryKind(abs);
+    if (kind) {
+      return `${rel} is ${kind === 'binary' ? 'a binary file' : `a ${kind} file`}, not text.\n`
+        + 'These tools only read text, and its bytes would be unreadable. Do not try to read it again.\n'
+        + 'To ask a question about this document, attach it to a chat instead:\n'
+        + `  npm run chat -- "your question" --file ${rel}`;
+    }
 
     const lines = readAt(abs).split('\n');
     const total = lines.length;
@@ -830,7 +903,12 @@ if (CONVERSATION) {
 } else if (!REUSE) {
   const made = await fetch(`${BRIDGE}/conversations/new`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...(MODEL ? { model: MODEL } : {}), ...(ASSISTANT ? { assistant: ASSISTANT } : {}), message: 'Starting a new working session.' }),
+    body: JSON.stringify({
+      ...(MODEL ? { model: MODEL } : {}),
+      ...(ASSISTANT ? { assistant: ASSISTANT } : {}),
+      temporary: !PERMANENT,
+      message: 'Starting a new working session.',
+    }),
   }).then((r) => r.json()).catch((err) => ({ error: { message: String(err.message) } }));
   if (made?.error) console.error(red(`could not start a new conversation: ${made.error.message}`));
 }
@@ -839,23 +917,82 @@ const bridgeStatus = await fetch(`${BRIDGE}/status`).then((r) => r.json()).catch
 console.log(bold('root  ') + ROOT);
 console.log(bold('mode  ') + (APPLY ? green('APPLY — files will be written') : 'dry run (pass --apply to write)'));
 console.log(bold('chat  ') + (bridgeStatus?.conversation ?? 'resolves on first message') +
-  dim(CONVERSATION ? '  (continuing)' : REUSE ? '  (reusing the most recent)' : '  (new)') +
+  dim(CONVERSATION ? '  (continuing)' : REUSE ? '  (reusing the most recent)' : PERMANENT ? '  (new)' : '  (new, temporary)') +
   (ASSISTANT ? dim(`  · assistant ${ASSISTANT}`) : ''));
 
 const useSlim = SLIM || Boolean(ASSISTANT);
+
+const quota = (fresh = false) =>
+  fetch(`${BRIDGE}/quota${fresh ? '?refresh=1' : ''}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null);
+
+const credits = (n) => n.toLocaleString('en-US', { maximumFractionDigits: n < 100 ? 2 : 0 });
+
+async function reportCredits(before) {
+  const after = await quota(true);
+  if (!after) return;
+  const spent = before ? before.available - after.available : null;
+  console.log(dim(`\ncredits  ${spent > 0 ? `${credits(spent)} this run · ` : ''}${credits(after.available)} of ${credits(after.limit)} left`));
+}
+
+let rl = null;
+let rlEnded = false;
+let awaiting = null;
+
+async function prompt(text) {
+  if (rlEnded) return null;
+  if (!rl) {
+    const { createInterface } = await import('node:readline');
+    rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('close', () => { rlEnded = true; const settle = awaiting; awaiting = null; settle?.(null); });
+  }
+  return new Promise((resolve) => {
+    awaiting = resolve;
+    rl.question(text, (answer) => { awaiting = null; resolve(answer); });
+  });
+}
+
+const canPrompt = () => Boolean(process.stdin.isTTY) || !WATCH;
+
+function writeOverlay() {
+  let written = 0;
+  let deleted = 0;
+  for (const [abs, text] of overlay) {
+    if (text === DELETED) {
+      if (fs.existsSync(abs)) {
+        fs.unlinkSync(abs);
+        deleted++;
+      }
+    } else {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, text);
+      written++;
+    }
+  }
+  const parts = [
+    written ? `wrote ${written} file(s)` : '',
+    deleted ? `deleted ${deleted} file(s)` : '',
+  ].filter(Boolean);
+  console.log(green(`\n${parts.join(', ') || 'done'} to disk`));
+}
 
 // One task: drive the loop to a DONE (or a limit), then report and write.
 // The conversation persists across calls, so the model keeps its context.
 async function runTask(taskText, { first }) {
   overlay.clear();
+  const creditsBefore = await quota();
   let listing = '';
   try { listing = outbound(TOOLS.list('.')); } catch { /* ignore */ }
+
+  const again = `The project is still open in front of me and I will paste you whatever you ask for.`
+    + `\nTop level right now:\n${listing}`;
 
   let next = useSlim
     ? `${first ? `Top level of the project: ${listing}\n\n` : ''}Task: ${taskText}\n\nWhat should I open first?`
     : first
       ? `${PREAMBLE}\n\nTo save you a step, here is what is at the top level already:\n${listing}\n\nHere is what I want to know: ${taskText}\n\nWhat should I open first?`
-      : `New task: ${taskText}\n\nWhat should I open first?`;
+      : `${again}\n\nNew task: ${taskText}\n\nWhat should I open first?`;
 
   let nudges = 0;
   for (let step = 1; step <= MAX_STEPS; step++) {
@@ -897,11 +1034,12 @@ async function runTask(taskText, { first }) {
       let result;
       try { result = await TOOLS[call.kind](call.arg, call.body); }
       catch (err) { result = `error: ${err.message}`; }
-      const head = String(result).split('\n')[0] ?? '';
-      const ok = !/^(no such|error|the text)/.test(result);
+      const [head, ...rest] = String(result).split('\n');
+      const refused = /^(no such|error|the text|that text)/.test(result) || / is (a|an) .*, not text\.$/.test(head);
       const isLast = (i === work.length - 1) && !done;
       const branch = isLast ? '└── ' : '├── ';
-      console.log(`  ${gray(branch)}${ok ? green('✓') : red('✗')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
+      console.log(`  ${gray(branch)}${!refused ? green('✓') : red('✗')} ${call.kind} ${call.arg} ${dim(head.slice(0, 70))}`);
+      if (refused) for (const line of rest) console.log(dim(`      ${line}`));
       results.push(`Result of ${call.kind} ${call.arg}:\n${outbound(result)}`);
     }
 
@@ -915,47 +1053,28 @@ async function runTask(taskText, { first }) {
     if (step === MAX_STEPS) console.log(red('\nreached the step limit'));
   }
 
+  await reportCredits(creditsBefore);
   showDiff();
-  if (APPLY && overlay.size) {
-    let written = 0;
-    let deleted = 0;
-    for (const [abs, text] of overlay) {
-      if (text === DELETED) {
-        if (fs.existsSync(abs)) {
-          fs.unlinkSync(abs);
-          deleted++;
-        }
-      } else {
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, text);
-        written++;
-      }
-    }
-    const parts = [
-      written ? `wrote ${written} file(s)` : '',
-      deleted ? `deleted ${deleted} file(s)` : '',
-    ].filter(Boolean);
-    console.log(green(`\n${parts.join(', ') || 'done'} to disk`));
-  } else if (overlay.size) {
-    console.log(dim('\ndry run — nothing written. re-run with --apply'));
-  }
+  if (!overlay.size) return;
+  if (APPLY) return void writeOverlay();
+
+  const answer = canPrompt() ? await prompt(bold(`\napply ${overlay.size} change(s)? [y/N] `)) : null;
+  if (answer === null) console.log(dim('\ndry run — nothing written. re-run with --apply'));
+  else if (/^y(es)?$/i.test(answer.trim())) writeOverlay();
+  else console.log(dim('nothing written.'));
 }
 
 await runTask(task, { first: true });
 
 if (WATCH) {
-  const { createInterface } = await import('node:readline');
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
   console.log(dim('\n— watching. type another task, or press Ctrl+C to stop —'));
-  rl.setPrompt(bold('\ntask> '));
-  rl.prompt();
-  // The async iterator ends cleanly on EOF (piped input) or Ctrl+D.
-  for await (const raw of rl) {
+  for (;;) {
+    const raw = await prompt(bold('\ntask> '));
+    if (raw === null) break;
     const line = raw.trim();
     if (line === 'exit' || line === 'quit') break;
     if (line) await runTask(line, { first: false });
-    rl.prompt();
   }
-  rl.close();
+  rl?.close();
   console.log(dim('\ndone.'));
 }
