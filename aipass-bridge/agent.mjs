@@ -1014,10 +1014,12 @@ async function runTask(taskText, { first }) {
     const done = calls.find((c) => c.kind === 'done');
     const work = calls.filter((c) => c.kind !== 'done');
 
-    if (proseText && work.length > 0) {
+    if (proseText) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
-        console.log(`  ${gray('├── ')}${dim('thinking:')} ${truncate(firstLine, 80)}`);
+        const hasMore = work.length > 0 || Boolean(done);
+        const branch = hasMore ? '├── ' : '└── ';
+        console.log(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, 80)}`);
       }
     }
 

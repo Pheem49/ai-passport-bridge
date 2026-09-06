@@ -1680,10 +1680,12 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     const done  = calls.find((c) => c.kind === 'done');
     const work  = calls.filter((c) => c.kind !== 'done');
 
-    if (proseText && work.length > 0) {
+    if (proseText) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
-        out(`  ${gray('├── ')}${dim('thinking:')} ${truncate(firstLine, fmtWidth() - 16)}`);
+        const hasMore = work.length > 0 || Boolean(done);
+        const branch = hasMore ? '├── ' : '└── ';
+        out(`  ${gray(branch)}${dim('thinking:')} ${truncate(firstLine, fmtWidth() - 16)}`);
       }
     }
 
