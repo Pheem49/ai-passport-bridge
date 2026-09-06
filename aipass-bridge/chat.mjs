@@ -894,7 +894,7 @@ CRITICAL: You are an AI assistant collaborating with me in this chat. You do NOT
 A few practical notes. Answer in English. Look at a file before changing it, and copy the lines under FIND exactly as they appear. When I show a file the numbers down the left are only for reference — do not put them in FIND. Big files come a screen at a time; ask for a range like NEED file path 201-400 to see more. To find where something lives without reading every file, use SEARCH followed by the text. Use GLOB to find all files matching a pattern. Use GIT to see what has changed recently. Use FETCH to read a URL (docs, APIs). Use WEB followed by search keywords to search the internet (with live web search and citations). Some hostnames and addresses are written in a shortened form such as LCLHST and LOOPBACK-IP, and URLs start with HTTPS-URL or HTTP-URL; keep them as written and I will expand them again. If my question can be answered without changing anything, just answer it and end with DONE.`;
 
 const AGENT_REMINDER    = 'What next? Ask for anything else you need, or finish with DONE if you have enough.';
-const AGENT_MARKER_LINE = /^\s*(NEED\s+(dir|file)\b|SEARCH\b|GLOB\b|GIT\b|FETCH\b|WEB\b|DELETE\b|MOVE\b|EDIT\b|CREATE\b|FIND\s*$|NEW\s*$|END\s*$|RUN\s*$|DONE\b)/i;
+const AGENT_MARKER_LINE = /^\s*(NEED\s+(dir|file)\b|SEARCH\b|GLOB\b|GIT\b|FETCH\b|WEB\b|DELETE\b|MOVE\b|EDIT\b|CREATE\b|FIND\s*$|NEW\s*$|END\s*$|RUN\s*$|(?:\*{1,3}|#{1,6}\s*)?DONE\b)/i;
 /** @param {string} reply @returns {string} */
 const agentProse = (reply) => reply.split('\n').filter((/** @type {string} */ l) => !AGENT_MARKER_LINE.test(l)).join('\n').trim();
 
@@ -951,7 +951,7 @@ function agentParse(reply) {
       if (/^\s*END\s*$/i.test(lines[i] ?? '')) i++;
       calls.push({ kind: 'run', arg: '', body }); continue;
     }
-    m = /^\s*DONE\b\s*(.*)/i.exec(line);
+    m = /^\s*(?:\*{1,3}|#{1,6}\s*)?DONE\b[:\s—–-]*(.*)/i.exec(line);
     if (m) { i++; calls.push({ kind: 'done', arg: m[1].trim() }); continue; }
     i++;
   }
@@ -1663,6 +1663,7 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     `Here is what I want to know: ${cleanTask}\n\nWhat should I open first?`;
 
   let nudges = 0;
+  let toolsRun = 0;
   for (let step = 1; step <= maxSteps; step++) {
     const stepStart = Date.now();
     out('');
@@ -1679,7 +1680,6 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     const calls = agentParse(reply);
     const done  = calls.find((c) => c.kind === 'done');
     const work  = calls.filter((c) => c.kind !== 'done');
-
     if (proseText) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
@@ -1690,9 +1690,11 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
     }
 
     if (!work.length) {
-      if (done) {
-        out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || 'task complete'}`);
-        if (proseText && proseText.trim() !== (done.arg || '').trim()) {
+      const effectiveDone = done || (toolsRun > 0 && proseText ? { kind: 'done', arg: 'task complete' } : null);
+      if (effectiveDone) {
+        const cleanArg = (effectiveDone.arg || 'task complete').replace(/^[-—–:]\s*/, '').trim();
+        out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${cleanArg || 'task complete'}`);
+        if (proseText && proseText.trim() !== (effectiveDone.arg || '').trim() && proseText.trim() !== cleanArg) {
           out('');
           const md = makeRenderer();
           for (const l of proseText.split('\n')) md(l);
@@ -1708,6 +1710,7 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
 
     const results = [];
     for (let i = 0; i < work.length; i++) {
+      toolsRun++;
       const call = work[i];
       let result;
       try { result = await AGENT_TOOLS[call.kind](call.arg, call.body); }
@@ -1740,8 +1743,9 @@ async function runAgentTask(taskText, { maxSteps = 10, allowRun = false, autoApp
 
     const stillLooking = work.some((c) => c.kind === 'list' || c.kind === 'read' || c.kind === 'search');
     if (done && !stillLooking) {
-      out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${done.arg || 'task complete'}`);
-      if (proseText && proseText.trim() !== (done.arg || '').trim()) {
+      const cleanArg = (done.arg || 'task complete').replace(/^[-—–:]\s*/, '').trim();
+      out(`  ${gray('└── ')}${green('✓')} ${green('[done]')}   ${cleanArg || 'task complete'}`);
+      if (proseText && proseText.trim() !== (done.arg || '').trim() && proseText.trim() !== cleanArg) {
         out('');
         const md = makeRenderer();
         for (const l of proseText.split('\n')) md(l);

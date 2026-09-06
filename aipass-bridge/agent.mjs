@@ -607,7 +607,7 @@ const REMINDER = 'What next? Ask for anything else you need, or finish with DONE
 
 // The model usually writes its answer as prose and then a bare DONE, so fall
 // back to that prose rather than reporting an empty result.
-const MARKER_LINE = /^\s*(NEED\s+(dir|file)\b|SEARCH\b|GLOB\b|GIT\b|FETCH\b|WEB\b|DELETE\b|MOVE\b|EDIT\b|CREATE\b|FIND\s*$|NEW\s*$|END\s*$|RUN\s*$|DONE\b)/i;
+const MARKER_LINE = /^\s*(NEED\s+(dir|file)\b|SEARCH\b|GLOB\b|GIT\b|FETCH\b|WEB\b|DELETE\b|MOVE\b|EDIT\b|CREATE\b|FIND\s*$|NEW\s*$|END\s*$|RUN\s*$|(?:\*{1,3}|#{1,6}\s*)?DONE\b)/i;
 const prose = (reply) => reply.split('\n').filter((l) => !MARKER_LINE.test(l)).join('\n').trim();
 
 function parse(reply) {
@@ -676,7 +676,7 @@ function parse(reply) {
       continue;
     }
 
-    m = /^\s*DONE\b\s*(.*)$/i.exec(line);
+    m = /^\s*(?:\*{1,3}|#{1,6}\s*)?DONE\b[:\s—–-]*(.*)$/i.exec(line);
     if (m) { i++; calls.push({ kind: 'done', arg: m[1].trim() }); continue; }
 
     i++;
@@ -999,6 +999,7 @@ async function runTask(taskText, { first }) {
       : `${again}\n\nNew task: ${taskText}\n\nWhat should I open first?`;
 
   let nudges = 0;
+  let toolsRun = 0;
   for (let step = 1; step <= MAX_STEPS; step++) {
     const stepStart = Date.now();
     let reply;
@@ -1013,7 +1014,6 @@ async function runTask(taskText, { first }) {
     const calls = parse(reply);
     const done = calls.find((c) => c.kind === 'done');
     const work = calls.filter((c) => c.kind !== 'done');
-
     if (proseText) {
       const firstLine = proseText.split('\n').map((l) => l.trim()).find((l) => l && !l.startsWith('#')) || proseText.split('\n')[0].trim();
       if (firstLine) {
@@ -1024,9 +1024,11 @@ async function runTask(taskText, { first }) {
     }
 
     if (!work.length) {
-      if (done) {
-        console.log(`  ${gray('└── ')}${green('✓')} ${done.arg || proseText || 'done'}`);
-        if (proseText && done.arg && proseText.trim() !== done.arg.trim()) {
+      const effectiveDone = done || (toolsRun > 0 && proseText ? { kind: 'done', arg: 'done' } : null);
+      if (effectiveDone) {
+        const cleanArg = (effectiveDone.arg || proseText || 'done').replace(/^[-—–:]\s*/, '').trim();
+        console.log(`  ${gray('└── ')}${green('✓')} ${cleanArg || 'done'}`);
+        if (proseText && effectiveDone.arg && proseText.trim() !== effectiveDone.arg.trim() && proseText.trim() !== cleanArg) {
           console.log('\n' + proseText.trim());
         }
         break;
@@ -1040,6 +1042,7 @@ async function runTask(taskText, { first }) {
 
     const results = [];
     for (let i = 0; i < work.length; i++) {
+      toolsRun++;
       const call = work[i];
       let result;
       try { result = await TOOLS[call.kind](call.arg, call.body); }
