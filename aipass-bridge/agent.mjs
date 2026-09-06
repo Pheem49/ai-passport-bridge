@@ -125,7 +125,7 @@ const DELETED = '\x00DELETE\x00';
 const readAt = (abs) => {
   if (overlay.has(abs)) {
     const val = overlay.get(abs);
-    if (val === DELETED) throw new Error(`file was deleted: ${path.relative(ROOT, abs)}`);
+    if (val === DELETED) throw new Error(`file was deleted: ${posix(path.relative(ROOT, abs))}`);
     return val;
   }
   return fs.readFileSync(abs, 'utf8');
@@ -137,6 +137,10 @@ const existsAt = (abs) => {
 const SKIP = new Set(['node_modules', '.git', '.next', 'dist', 'build', '.cache']);
 
 const clip = (s) => (s.length > MAX_RESULT ? `${s.slice(0, MAX_RESULT)}\n… truncated` : s);
+// Paths that go to the model come back from it, in a NEED file or an EDIT. On
+// Windows path.relative yields `src\a.ts`, so normalise to one separator
+// everywhere rather than teaching the model two shapes.
+const posix = (p) => p.split(path.sep).join('/');
 const READ_LINES = Number(flag('read-lines', 250));
 
 // read() shows a line-number gutter so the model can reference ranges. Those
@@ -377,7 +381,7 @@ const TOOLS = {
         const lines = text.split('\n');
         for (let i = 0; i < lines.length && hits.length < MAX; i++) {
           if (lines[i].includes(needle)) {
-            hits.push(`${path.relative(ROOT, full)}:${i + 1}: ${lines[i].trim().slice(0, 140)}`);
+            hits.push(`${posix(path.relative(ROOT, full))}:${i + 1}: ${lines[i].trim().slice(0, 140)}`);
           }
         }
       }
@@ -421,7 +425,7 @@ const TOOLS = {
         } else {
           match = segs.length === patParts.length && segs.every((s, i) => matchPart(patParts[i] ?? '', s));
         }
-        if (match && !e.isDirectory()) hits.push(rel);
+        if (match && !e.isDirectory()) hits.push(posix(rel));
         if (e.isDirectory()) walk(path.join(dir, e.name), depth + 1);
       }
     };
@@ -866,7 +870,7 @@ function showDiff() {
   console.log(bold('\nchanges:'));
   const entries = Array.from(overlay.entries());
   entries.forEach(([abs, next], idx) => {
-    const rel = path.relative(ROOT, abs);
+    const rel = posix(path.relative(ROOT, abs));
     const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     const diff = lineDiff(before.split('\n'), next === DELETED ? [] : next.split('\n'));
     const added = diff.filter((d) => d.t === '+').length;
@@ -879,7 +883,7 @@ function showDiff() {
   });
   console.log(bold(`\n${overlay.size} file(s) changed:\n`));
   for (const [abs, next] of overlay) {
-    const rel = path.relative(ROOT, abs);
+    const rel = posix(path.relative(ROOT, abs));
     const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     if (next === DELETED) {
       console.log(bold(`--- a/${rel}`));

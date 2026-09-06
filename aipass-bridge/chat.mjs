@@ -521,6 +521,9 @@ const AGENT_READ_LINES = 200;
 const agentClip = (s) => (s.length > AGENT_MAX_RESULT ? `${s.slice(0, AGENT_MAX_RESULT)}\n… truncated` : s);
 
 /** @param {string} p @returns {string} */
+const posix = (p) => p.split(path.sep).join('/');
+
+/** @param {string} p @returns {string} */
 function agentSafe(p) {
   const abs = path.resolve(agentRoot, p);
   if (abs !== agentRoot && !abs.startsWith(agentRoot + path.sep))
@@ -532,7 +535,7 @@ const AGENT_DELETED = '\x00DELETE\x00';
 const agentReadAt   = (abs) => {
   if (overlay.has(abs)) {
     const val = overlay.get(abs);
-    if (val === AGENT_DELETED) throw new Error(`file was deleted: ${path.relative(agentRoot, abs)}`);
+    if (val === AGENT_DELETED) throw new Error(`file was deleted: ${posix(path.relative(agentRoot, abs))}`);
     return /** @type {string} */ (val);
   }
   return fs.readFileSync(abs, 'utf8');
@@ -642,7 +645,7 @@ const AGENT_TOOLS = {
         const lines = txt.split('\n');
         for (let i = 0; i < lines.length && hits.length < MAX; i++) {
           if (lines[i].includes(needle))
-            hits.push(`${path.relative(agentRoot, full)}:${i + 1}: ${lines[i].trim().slice(0, 140)}`);
+            hits.push(`${posix(path.relative(agentRoot, full))}:${i + 1}: ${lines[i].trim().slice(0, 140)}`);
         }
       }
     };
@@ -699,7 +702,7 @@ const AGENT_TOOLS = {
           match = segs.length === patParts.length &&
             segs.every((s, i) => matchPart(patParts[i] ?? '', s));
         }
-        if (match && !e.isDirectory()) hits.push(rel);
+        if (match && !e.isDirectory()) hits.push(posix(rel));
         if (e.isDirectory()) walk(path.join(dir, e.name), depth + 1);
       }
     };
@@ -1597,7 +1600,7 @@ function agentShowDiff() {
   out(bold('changes:'));
   const entries = Array.from(overlay.entries());
   entries.forEach(([abs, next], idx) => {
-    const rel = path.relative(agentRoot, abs);
+    const rel = posix(path.relative(agentRoot, abs));
     const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     const diff = lineDiff(before.split('\n'), next === AGENT_DELETED ? [] : next.split('\n'));
     const added = diff.filter((d) => d.t === '+').length;
@@ -1610,7 +1613,7 @@ function agentShowDiff() {
   });
 
   for (const [abs, next] of overlay) {
-    const rel    = path.relative(agentRoot, abs);
+    const rel    = posix(path.relative(agentRoot, abs));
     const before = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : '';
     out('');
     if (next === AGENT_DELETED) {
