@@ -2439,7 +2439,7 @@ function drawMenu({ keepSel = false } = {}) {
 if (TTY) {
   // Wrap internal readline keypress listener so we can intercept Ctrl+D on empty prompt
   const [rlKeypressListener] = stdin.rawListeners('keypress');
-  if (rlKeypressListener) stdin.removeListener('keypress', rlKeypressListener);
+  if (rlKeypressListener) stdin.removeListener('keypress', /** @type {(...args: any[]) => void} */ (rlKeypressListener));
 
   stdin.on('keypress', (/** @type {string} */ ch, /** @type {import('node:readline').Key} */ key) => {
     const name = key?.name;
@@ -2932,6 +2932,7 @@ for (;;) {
   if (line === '/tone' || line.startsWith('/tone ')) {
     const rawVal = line === '/tone' ? '' : line.slice(5).trim().toLowerCase();
     if (!rawVal) {
+      /** @type {any} */
       const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
       /** @type {Array<{ id: string, label?: string, note?: string }>} */
       const items = [
@@ -2978,6 +2979,7 @@ for (;;) {
   if (line === '/format' || line.startsWith('/format ')) {
     const rawVal = line === '/format' ? '' : line.slice(7).trim().toLowerCase();
     if (!rawVal) {
+      /** @type {any} */
       const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
       /** @type {Array<{ id: string, label?: string, note?: string }>} */
       const items = [
@@ -3021,7 +3023,9 @@ for (;;) {
 
   // `/styles` prints current style status and available preset options
   if (line === '/styles') {
+    /** @type {any} */
     const styleRes = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
+    /** @type {any} */
     const videoRes = await fetch(`${BRIDGE}/video-options`).then((r) => r.json()).catch(() => null);
 
     console.log(bold('\n  Current Active Styles:'));
@@ -3054,6 +3058,7 @@ for (;;) {
   if (line === '/image-style' || line.startsWith('/image-style ')) {
     const rawVal = line === '/image-style' ? '' : line.slice(12).trim();
     if (!rawVal) {
+      /** @type {any} */
       const bridgeOpts = await fetch(`${BRIDGE}/style-options`).then((r) => r.json()).catch(() => null);
       /** @type {Array<{ id: string, label?: string, note?: string }>} */
       const items = [
@@ -3102,6 +3107,7 @@ for (;;) {
   if (line === '/video-style' || line.startsWith('/video-style ')) {
     const rawVal = line === '/video-style' ? '' : line.slice(12).trim();
     if (!rawVal) {
+      /** @type {any} */
       const bridgeOpts = await fetch(`${BRIDGE}/video-options`).then((r) => r.json()).catch(() => null);
       /** @type {Array<{ id: string, label?: string, note?: string }>} */
       const items = [
@@ -3145,6 +3151,7 @@ for (;;) {
 
   // `/credits` or `/quota` displays an aesthetic credit and quota meter card
   if (line === '/credits' || line === '/quota') {
+    /** @type {any} */
     const quota = await fetch(`${BRIDGE}/quota`).then((r) => r.json()).catch(() => null);
     if (!quota || quota.error || typeof quota.available !== 'number') {
       console.log(red('  ✗ could not fetch credit figures from bridge'));
@@ -3188,7 +3195,7 @@ for (;;) {
   if (line === '/doctor') {
     console.log(bold('\n  🩺 Running inline diagnostics…\n'));
     const getEndpoint = (/** @type {string} */ p) =>
-      fetch(`${BRIDGE}${p}`).then(async (r) => ({ ok: r.ok, status: r.status, body: await r.json().catch(() => null) })).catch(() => ({ ok: false, status: 0, body: null }));
+      fetch(`${BRIDGE}${p}`).then(async (r) => ({ ok: r.ok, status: r.status, body: /** @type {any} */ (await r.json().catch(() => null)) })).catch(() => ({ ok: false, status: 0, body: /** @type {any} */ (null) }));
 
     // 1. Bridge check
     const stRes = await getEndpoint('/status');
@@ -3299,6 +3306,7 @@ for (;;) {
         continue;
       }
 
+      /** @type {any} */
       const bindRes = await fetch(`${BRIDGE}/assistants/${encodeURIComponent(chosen.id)}/chat`, { method: 'POST' })
         .then((x) => x.json()).catch(() => null);
       if (bindRes?.conversation) {
@@ -3318,6 +3326,7 @@ for (;;) {
       continue;
     }
 
+    /** @type {any} */
     const bindRes = await fetch(`${BRIDGE}/assistants/${encodeURIComponent(rawVal)}/chat`, { method: 'POST' })
       .then((x) => x.json()).catch(() => null);
     if (bindRes?.conversation) {
