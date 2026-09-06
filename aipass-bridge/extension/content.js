@@ -14,9 +14,8 @@ async function toWorker(payload, attempt = 0) {
   try {
     await chrome.runtime.sendMessage({ type: 'from-page', payload });
   } catch {
-    const maxAttempts = payload?.kind === 'done' ? 30 : 12;
-    if (attempt >= maxAttempts) return;
-    setTimeout(() => toWorker(payload, attempt + 1), 150 * (attempt + 1));
+    if (attempt >= 5) return;
+    setTimeout(() => toWorker(payload, attempt + 1), 200 * (attempt + 1));
   }
 }
 
@@ -25,8 +24,7 @@ window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   const msg = event.data;
   if (!msg || typeof msg !== 'object' || msg[TAG] !== 'res') return;
-  const payload = { ...msg };
-  delete payload[TAG];
+  const { [TAG]: _, ...payload } = msg;
   toWorker(payload);
 });
 

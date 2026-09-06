@@ -1,9 +1,15 @@
 {
   "manifest_version": 3,
   "name": "aipass bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Relays local OpenAI-compatible requests through an open de.aipass.net tab.",
-  "permissions": ["storage", "alarms", "tabs", "scripting", "offscreen"],
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "scripting",
+    "offscreen"
+  ],
   "host_permissions": [
     "https://*.aipass.net/*",
     "https://aipass.net/*",
@@ -17,14 +23,24 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://*.aipass.net/*", "https://aipass.net/*"],
-      "js": ["page.js"],
+      "matches": [
+        "https://*.aipass.net/*",
+        "https://aipass.net/*"
+      ],
+      "js": [
+        "page.js"
+      ],
       "world": "MAIN",
       "run_at": "document_start"
     },
     {
-      "matches": ["https://*.aipass.net/*", "https://aipass.net/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://*.aipass.net/*",
+        "https://aipass.net/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "world": "ISOLATED",
       "run_at": "document_start"
     }

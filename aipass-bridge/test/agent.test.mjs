@@ -76,6 +76,51 @@ test('dry run shows a diff but writes nothing; --apply writes', async (t) => {
   assert.equal(fs.readFileSync(path.join(wet, 'b.txt'), 'utf8'), 'brand new');
 });
 
+test('the diff still renders when there is no diff binary (the Windows shape)', async (t) => {
+  // PATH stripped, so execFileSync('diff') fails with ENOENT — exactly what
+  // happens on Windows. It used to print the file header and then nothing.
+  const dir = tempDir({ 'a.txt': 'hello' });
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: scripted(['EDIT a.txt\nFIND\nhello\nNEW\ngoodbye\nEND\nDONE changed a.txt']),
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out } = await agent(dir, ['--apply'], { env: { PATH: '' } });
+  assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'goodbye', 'the edit itself still lands');
+  assert.match(out, /--- a\/a\.txt/);
+  assert.match(out, /-hello/);
+  assert.match(out, /\+goodbye/);
+});
+
+test('a dry run offers to apply, and answering y writes the files', async (t) => {
+  const replies = [
+    'EDIT a.txt\nFIND\nhello\nNEW\ngoodbye\nEND\nCREATE b.txt\nbrand new\nEND',
+    'DONE changed things',
+  ];
+  const dir = tempDir({ 'a.txt': 'hello' });
+  const ext = await new FakeExtension(bridge.base, { onChat: scripted(replies) }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out } = await agent(dir, [], { stdin: [[300, 'y\n']] });
+  assert.match(out, /apply 2 change\(s\)\?/, 'the diff must be followed by an offer to write it');
+  assert.match(out, /wrote 2 file\(s\)/);
+  // The point of the prompt: one run, and what was shown is what landed.
+  assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'goodbye');
+  assert.equal(fs.readFileSync(path.join(dir, 'b.txt'), 'utf8'), 'brand new');
+});
+
+test('declining the apply prompt leaves the disk untouched', async (t) => {
+  const replies = ['CREATE b.txt\nbrand new\nEND', 'DONE made a file'];
+  const dir = tempDir({ 'a.txt': 'hello' });
+  const ext = await new FakeExtension(bridge.base, { onChat: scripted(replies) }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out } = await agent(dir, [], { stdin: [[300, 'n\n']] });
+  assert.match(out, /apply 1 change\(s\)\?/);
+  assert.match(out, /nothing written/);
+  assert.ok(!fs.existsSync(path.join(dir, 'b.txt')));
+});
+
 test('an edit whose FIND text does not match is reported, not applied', async (t) => {
   const dir = tempDir({ 'a.txt': 'hello' });
   const ext = await new FakeExtension(bridge.base, {
@@ -205,13 +250,27 @@ test('shell commands are refused unless --allow-run is given', async (t) => {
   assert.match(out, /disabled for this run/);
 });
 
-test('starts its own conversation by default', async (t) => {
+test('starts its own temporary conversation by default', async (t) => {
   const dir = tempDir({ 'a.txt': 'x' });
   const ext = await new FakeExtension(bridge.base, { onChat: scripted(['DONE nothing to do']) }).connect();
   t.after(() => ext.disconnect());
 
   const { out } = await agent(dir);
   assert.equal(ext.created.length, 1, 'a conversation should be created for the run');
+  assert.equal(ext.created[0].temporary, true, 'a run should not land in chat history');
+  assert.equal(ext.chats.at(-1).conversationId, 'M5uhmgOBsPk0v4WN', 'the run must use the conversation it created');
+  assert.equal(ext.chats.at(-1).temporary, true);
+  assert.match(out, /\(new, temporary\)/);
+});
+
+test('--permanent keeps the run in the account\'s chat history', async (t) => {
+  const dir = tempDir({ 'a.txt': 'x' });
+  const ext = await new FakeExtension(bridge.base, { onChat: scripted(['DONE nothing to do']) }).connect();
+  t.after(() => ext.disconnect());
+
+  const { out } = await agent(dir, ['--permanent']);
+  assert.equal(ext.created.length, 1);
+  assert.ok(!ext.created[0].temporary);
   const fresh = ext.created[0].requestId.replace(/-/g, '').slice(0, 16);
   assert.equal(ext.chats.at(-1).conversationId, fresh, 'the run must use the conversation it created');
   assert.match(out, /\(new\)/);
@@ -314,7 +373,7 @@ test('--assistant binds the created conversation and implies slim', async (t) =>
   const ext = await new FakeExtension(bridge.base, { onChat: scripted(['DONE nothing to do']) }).connect();
   t.after(() => ext.disconnect());
 
-  await agent(dir, ['--assistant', 'asst_abc123']);
+  const { out } = await agent(dir, ['--assistant', 'asst_abc123']);
   assert.equal(ext.created.length, 1);
   assert.equal(ext.created[0].assistant, 'asst_abc123', 'the create job carries the assistant id');
   assert.equal(ext.created[0].assistantField, 'aiAssistantId', 'and the configured field name');
@@ -334,7 +393,7 @@ test('read shows line numbers and pages a long file with a range hint', async (t
   await agent(dir);
   const firstResult = handler.sent[1];    // the result of the first read is in turn 2's message
   assert.match(firstResult, /1 \| line 1/, 'line numbers present');
-  assert.match(firstResult, /more line\(s\)\. To see them: NEED file big\.txt 201-/, 'range hint present');
+  assert.match(firstResult, /more line\(s\)\. To see them: NEED file big\.txt 251-/, 'range hint present');
   assert.doesNotMatch(firstResult, /line 300/, 'a long file is not dumped whole');
 
   const rangeResult = handler.sent[2];     // the result of the ranged read
@@ -456,4 +515,78 @@ test('tag-shaped content passes a tag-blocking edge and restores byte-for-byte',
     original.replace('lang="en"', 'lang="th"'),
     'only the intended edit is applied; all other tags are intact',
   );
+});
+
+// Issue #32. `read` and `exists` both treat the overlay as reality, so a listing
+// that ignores it tells the model its own write failed. The model then re-creates
+// the file, doubts the tools, and talks itself into "I cannot reach your
+// filesystem" — a belief that --watch then carries into every follow-up task.
+test('a file the agent just wrote appears in its own directory listing', async (t) => {
+  const dir = tempDir({ 'other.txt': 'x\n' });
+  const handler = scripted([
+    'CREATE hello.txt\nHello, world!\nEND\n\nNEED dir .',
+    'DONE done',
+  ]);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await agent(dir, ['--apply']);
+  const listing = handler.sent.at(-1);
+  assert.match(listing, /hello\.txt/, 'the pending write must be visible');
+  assert.match(listing, /other\.txt/, 'and the file already on disk still is');
+});
+
+test('a pending write in a new subdirectory shows the directory', async (t) => {
+  const dir = tempDir({});
+  const handler = scripted(['CREATE sub/deep.txt\nhi\nEND\n\nNEED dir .', 'DONE done']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await agent(dir, ['--apply']);
+  assert.match(handler.sent.at(-1), /sub\//, 'the parent directory is what the model can list next');
+});
+
+// Issue #31. Reading a PDF as text returned mojibake, and the model spent the
+// whole run trying to interpret it — 519 credits in the report.
+test('a binary file is refused with somewhere else to go, not read as text', async (t) => {
+  const dir = tempDir({});
+  fs.writeFileSync(path.join(dir, 'doc.pdf'), Buffer.from('%PDF-1.5\n%\xc7\xec\x8f\xa2\n', 'latin1'));
+  fs.writeFileSync(path.join(dir, 'sheet.xlsx'), Buffer.from('PK\x03\x04\x14\x00\x00\x00', 'latin1'));
+  const handler = scripted(['NEED file doc.pdf', 'NEED file sheet.xlsx', 'DONE stopping']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await agent(dir);
+  const afterPdf = handler.sent[1];
+  assert.match(afterPdf, /is a PDF file, not text/);
+  assert.match(afterPdf, /--file doc\.pdf/, 'it must name the command that does work');
+  assert.ok(!/%PDF/.test(afterPdf.split('doc.pdf is a PDF')[1] ?? ''), 'no raw bytes are forwarded');
+  assert.match(handler.sent[2], /zip-based document/, 'an xlsx is named by what it is');
+});
+
+test('a text file that merely contains odd bytes is still readable', async (t) => {
+  const dir = tempDir({ 'thai.txt': 'สวัสดีครับ\nบรรทัดที่สอง\n', 'code.js': 'const a = 1;\n' });
+  const handler = scripted(['NEED file thai.txt', 'DONE ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await agent(dir);
+  assert.match(handler.sent.at(-1), /สวัสดีครับ/, 'UTF-8 text is not binary');
+});
+
+// The other half of issue #32: --watch continues the same conversation, so a
+// follow-up inherited the model's earlier (wrong) conclusion that it could not
+// reach the filesystem. A bare "New task:" gave it nothing to correct against.
+test('a --watch follow-up re-states the frame and the current listing', async (t) => {
+  const dir = tempDir({ 'a.txt': 'x\n' });
+  const handler = scripted(['DONE nothing to do']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await agent(dir, ['--watch'], { stdin: [[300, 'second task\n'], [400, 'exit\n']] });
+  assert.ok(handler.sent.length >= 2, 'the follow-up task ran');
+  const followUp = handler.sent.at(-1);
+  assert.match(followUp, /New task: second task/);
+  assert.match(followUp, /still open in front of me/, 'the frame is restated');
+  assert.match(followUp, /a\.txt/, 'with ground truth to correct a drifted belief against');
 });

@@ -24,7 +24,17 @@ const IDLE_TIMEOUT_MS = Number(process.env.AIPASS_IDLE_TIMEOUT_MS ?? 180_000);
 // here and would kill a generation that was going to succeed — and the credits
 // are already spent by then.
 const MEDIA_TIMEOUT_MS = Number(process.env.AIPASS_MEDIA_TIMEOUT_MS ?? 900_000);
-const MAX_BODY = 8 * 1024 * 1024;
+// How often a streaming response emits an SSE comment when it has nothing else
+// to say. Comfortably inside the 300s body timeout that Node's own fetch applies.
+const KEEPALIVE_MS = Number(process.env.AIPASS_KEEPALIVE_MS ?? 15_000);
+// Attachments up to MAX_ATTACHMENT_BYTES travel Base64-inlined in a JSON
+// envelope, which costs a third again plus escaping — the client-facing cap has
+// to hold that whole envelope or the advertised 20 MB file is undeliverable.
+const MAX_BODY = 32 * 1024 * 1024;
+// The extension's own posts are trusted and carry generated media inline (a
+// video up to the page's 50 MB inline cap is ~67 MB of Base64), so they get a
+// higher ceiling than client requests.
+const MAX_EXT_BODY = 128 * 1024 * 1024;
 
 let defaultModel = process.env.AIPASS_MODEL ?? 'gemini-3.1-flash-lite';
 // Bind newly created conversations to a custom aipass assistant. The form field
@@ -100,6 +110,17 @@ const LOADERS = {
   // Unlike the other two this one answers with plain JSON and takes no _routes
   // parameter, so it is parsed rather than turbo-stream decoded.
   quota: '/loaders/get-usage-quota',
+  assistants: '/loaders/list-ai-assistants.data?_routes=routes%2Floaders%2Flist-ai-assistants',
+  // The four that describe what a video model will accept. Each answers with
+  // rows keyed by *provider* — seedance, veo, or "all" — never by model id.
+  videoResolutions: '/loaders/list-video-resolutions.data?_routes=routes%2Floaders%2Flist-video-resolutions',
+  videoDurations: '/loaders/list-video-durations.data?_routes=routes%2Floaders%2Flist-video-durations',
+  videoAspectRatios: '/loaders/list-video-aspect-ratios.data?_routes=routes%2Floaders%2Flist-video-aspect-ratios',
+  videoStyles: '/loaders/list-video-styles.data?_routes=routes%2Floaders%2Flist-video-styles',
+  // Image styles carry no preprompt — they are sent by id as imageStyleId,
+  // unlike a video style, which is sent as its preprompt text.
+  imageStyles: '/loaders/list-image-styles.data?_routes=routes%2Floaders%2Flist-image-styles',
+  outputStyles: '/loaders/list-output-styles.data?_routes=routes%2Floaders%2Flist-output-styles',
 };
 
 // list-models carries no category field — the tabs in the web UI (สนทนา,
@@ -142,13 +163,100 @@ const VIDEO_PROVIDERS = [
 ];
 const videoProviderOf = (id) => VIDEO_PROVIDERS.find(([, re]) => re.test(id))?.[0];
 
-// Which video models accept a resolution, and which. The app gates only this
-// one option by model — everything else it sends whenever the caller set it —
-// so the bridge mirrors that rather than inventing stricter rules.
-const VIDEO_RESOLUTIONS = {
-  'seedance-2.0-fast': ['480p', '720p'],
-  'seedance-2.0-mini': ['480p', '720p'],
+// Last-resort resolutions, used only when the loader cannot be read — no tab, or
+// the route moved. These came from the app bundle, and the live loader disagrees
+// with them: it serves 480p alone for this account. That disagreement is the
+// whole reason the served values win.
+const VIDEO_RESOLUTIONS_FALLBACK = { seedance: ['480p', '720p'] };
+
+// What the four video-option loaders returned, refreshed with the model list.
+let videoOptions = { at: 0, resolutions: [], durations: [], aspectRatios: [], styles: [] };
+// Image styles, and the tone/format presets that apply to any chat model.
+let styleOptions = { at: 0, imageStyles: [], tones: [], formats: [] };
+
+// Every one of those loaders answers with the same row shape, so one reader
+// covers all four: the first array of objects carrying a string id.
+function extractRows(decoded) {
+  let rows = null;
+  const walk = (v) => {
+    if (!v || typeof v !== 'object' || rows) return;
+    if (Array.isArray(v)) {
+      if (v.length && v.every((x) => x && typeof x === 'object' && typeof x.id === 'string')) { rows = v; return; }
+      return void v.forEach(walk);
+    }
+    Object.values(v).forEach(walk);
+  };
+  walk(decoded);
+  return (rows ?? []).filter((r) => r.is_active !== false);
+}
+
+// Rows that apply to one provider. An "all" row applies to every provider, which
+// is how 16:9 reaches veo while 21:9 stays specific to seedance.
+const forProvider = (rows, provider) =>
+  rows.filter((r) => r.provider === provider || r.provider === 'all');
+
+const valuesFor = (rows, provider) => [...new Set(forProvider(rows, provider).map((r) => r.value))];
+
+async function refreshVideoOptions() {
+  const read = async (key) => {
+    try { return extractRows(decodeTurboStream(await fetchLoader(LOADERS[key]))); }
+    catch { return []; }
+  };
+  const [resolutions, durations, aspectRatios, styles] = await Promise.all([
+    read('videoResolutions'), read('videoDurations'), read('videoAspectRatios'), read('videoStyles'),
+  ]);
+  if (resolutions.length || durations.length || aspectRatios.length || styles.length) {
+    videoOptions = { at: Date.now(), resolutions, durations, aspectRatios, styles };
+    log(`video options: ${resolutions.length} resolution(s), ${durations.length} duration(s), `
+      + `${aspectRatios.length} ratio(s), ${styles.length} style(s)`);
+  }
+  return videoOptions;
+}
+
+async function refreshStyleOptions() {
+  const read = async (key) => {
+    try { return decodeTurboStream(await fetchLoader(LOADERS[key])); }
+    catch { return null; }
+  };
+  const [imageDecoded, outputDecoded] = await Promise.all([read('imageStyles'), read('outputStyles')]);
+  const imageStyles = imageDecoded ? extractRows(imageDecoded) : [];
+  // Output styles answer with two named lists rather than one array, so they are
+  // picked out by name instead of going through extractRows.
+  let tones = [];
+  let formats = [];
+  const walk = (v) => {
+    if (!v || typeof v !== 'object') return;
+    if (Array.isArray(v.tones)) tones = v.tones;
+    if (Array.isArray(v.formats)) formats = v.formats;
+    Object.values(v).forEach(walk);
+  };
+  if (outputDecoded) walk(outputDecoded);
+  if (imageStyles.length || tones.length || formats.length) {
+    styleOptions = { at: Date.now(), imageStyles, tones, formats };
+    log(`styles: ${imageStyles.length} image, ${tones.length} tone(s), ${formats.length} format(s)`);
+  }
+  return styleOptions;
+}
+
+// Match a preset by its English name, its Thai name, or its code — whichever the
+// caller happened to have to hand.
+const matchPreset = (rows, wanted) => {
+  const want = String(wanted).trim().toLowerCase();
+  return rows.find((r) =>
+    String(r.name_en ?? r.nameEn ?? '').toLowerCase() === want
+    || String(r.name_th ?? r.nameTh ?? '').trim() === String(wanted).trim()
+    || String(r.code ?? '').toLowerCase() === want
+    || String(r.id ?? '').toLowerCase() === want);
 };
+
+// A style may be named rather than pasted: --style Documentary resolves to that
+// preset's preprompt, which is what the web client actually sends.
+function stylePreprompt(text) {
+  const wanted = String(text).trim().toLowerCase();
+  const hit = videoOptions.styles.find((v) =>
+    String(v.name_en ?? '').toLowerCase() === wanted || String(v.name_th ?? '').trim() === String(text).trim());
+  return hit?.preprompt ?? text;
+}
 
 // How many images a video model will take alongside the prompt, and in which
 // role. Not used to send anything yet; reported on /v1/models so a client can
@@ -191,21 +299,6 @@ function extractModels(decoded) {
         isDefault: v.isDefault === true,
         thinking: Array.isArray(v.thinkingConfig?.supportedLevels) ? v.thinkingConfig.supportedLevels : null,
         media: kind !== 'chat' && kind !== 'research',
-        // What this model will actually take beyond a prompt. Only video has a
-        // surface worth reporting; everything else is uniform.
-        options: kind === 'video'
-          ? {
-              provider: videoProviderOf(id) ?? null,
-              aspectRatio: true,
-              stylePreprompt: true,
-              // Only seedance takes these; the app omits them for everything else.
-              duration: /^seedance/i.test(id),
-              cameraFixed: /^seedance/i.test(id),
-              generateAudio: /^seedance/i.test(id),
-              resolutions: VIDEO_RESOLUTIONS[id] ?? null,
-              images: VIDEO_IMAGE_LIMITS[id] ?? null,
-            }
-          : null,
       });
     }
     Object.values(v).forEach(walk);
@@ -230,7 +323,7 @@ const sendToClient = (client, event, data) =>
   client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
 class Job {
-  constructor({ kind = 'chat', modelId, text, parts, conversationId, aspectRatio: ratio, url, message, requestId, assistant, assistantField, temporary, thinkingLevel, video, timeoutMs, onDelta, onDone, onError }) {
+  constructor({ kind = 'chat', modelId, text, parts, conversationId, aspectRatio: ratio, url, message, requestId, assistant, assistantField, temporary, thinkingLevel, video, spec, imageStyleId, outputTone, outputFormat, timeoutMs, onDelta, onDone, onError }) {
     this.id = randomUUID();
     this.kind = kind;
     this.url = url;
@@ -241,6 +334,10 @@ class Job {
     this.temporary = temporary;
     this.thinkingLevel = thinkingLevel;
     this.video = video;
+    this.spec = spec;
+    this.imageStyleId = imageStyleId;
+    this.outputTone = outputTone;
+    this.outputFormat = outputFormat;
     this.timeoutMs = timeoutMs ?? IDLE_TIMEOUT_MS;
     this.modelId = modelId;
     this.text = text;
@@ -266,9 +363,11 @@ class Job {
       ? { jobId: this.id, kind: 'loader', url: this.url }
       : this.kind === 'create'
       ? { jobId: this.id, kind: 'create', modelId: this.modelId, message: this.message, requestId: this.requestId, assistant: this.assistant, assistantField: this.assistantField, temporary: this.temporary }
+      : this.kind === 'assistant'
+      ? { jobId: this.id, kind: 'assistant', ...this.spec }
       : this.kind === 'video'
       ? { jobId: this.id, kind: 'video', conversationId: this.conversationId, modelId: this.modelId, text: this.text, ...this.video }
-      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text, parts: this.parts, aspectRatio: this.aspectRatio, temporary: this.temporary, thinkingLevel: this.thinkingLevel });
+      : { jobId: this.id, kind: 'chat', conversationId: this.conversationId, modelId: this.modelId, text: this.text, parts: this.parts, aspectRatio: this.aspectRatio, temporary: this.temporary, thinkingLevel: this.thinkingLevel, imageStyleId: this.imageStyleId, outputTone: this.outputTone, outputFormat: this.outputFormat });
   }
   delta(part) { if (!this.settled) { this.touch(); this.onDelta(part); } }
   done(value) { if (this.settled) return; this.cleanup(); this.onDone(value ?? 'stop'); }
@@ -466,7 +565,7 @@ async function resolveConversation() {
 
 // A 404 means the conversation was deleted; a 409 means the server still
 // believes a generation is running there. Neither recovers on its own.
-function startChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, video, onDelta, onDone, onError }) {
+function startChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, video, imageStyleId, outputTone, outputFormat, onDelta, onDone, onError }) {
   // A video model does not go through /actions/send-message at all — it is a
   // job submitted to /actions/video-generation and then polled. Same Job
   // machinery, different kind, so retries and aborts behave the same way.
@@ -484,8 +583,12 @@ function startChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, vi
     current = new Job({
       kind: isVideo ? 'video' : 'chat',
       modelId, text, parts, conversationId, aspectRatio: ratio, thinkingLevel,
+      imageStyleId, outputTone, outputFormat,
       temporary: conversationIsTemporary,
-      video: isVideo ? { ...video, aspectRatio: video?.aspectRatio ?? ratio } : undefined,
+      // No aspect-ratio fallback here: videoOptionsFor already read the request
+      // and dropped a ratio this provider is not served. Re-adding the raw value
+      // would put back exactly what validation just removed.
+      video: isVideo ? video : undefined,
       timeoutMs: ['video', 'music'].includes(kindOf(modelId)) ? MEDIA_TIMEOUT_MS : IDLE_TIMEOUT_MS,
       onDelta: (part) => { delivered++; onDelta(part); },
       onDone,
@@ -508,21 +611,38 @@ function startChat({ modelId, text, parts, aspectRatio: ratio, thinkingLevel, vi
   return { abort: () => current?.abort() };
 }
 
-// True for loopback, link-local and RFC1918 addresses. A bare domain name is
-// not classified here — that would need DNS resolution — so this blocks the
-// literal-IP SSRF attempts, which is what a URL in a chat message looks like.
+// True for loopback, link-local and RFC1918 addresses. The URL parser has
+// already normalised integer, hex and octal spellings of an IPv4 address to
+// dotted-quad by the time this sees the hostname, so those need no case of
+// their own. A bare domain name is not classified here — that would need DNS
+// resolution — so this blocks the literal-IP SSRF attempts, which is what a
+// URL in a chat message looks like.
+const privateV4 = (a, b) =>
+  a === 0 || a === 127 || a === 10                     // this-host, loopback, private
+  || (a === 169 && b === 254)                          // link-local incl. cloud metadata
+  || (a === 192 && b === 168)
+  || (a === 172 && b >= 16 && b <= 31);                // 172.16.0.0/12
+
 function isPrivateHost(host) {
-  if (host === 'localhost' || host.endsWith('.localhost')) return true;
-  if (host === '::1' || host === '[::1]') return true;
-  if (/^\[?(fe80|fc|fd)/i.test(host)) return true;           // IPv6 link-local / unique-local
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  let h = String(host).toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  if (h === '::' || h === '::1') return true;                 // unspecified / loopback
+  if (/^fe[89ab][0-9a-f]:/.test(h)) return true;               // fe80::/10 link-local
+  if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;               // fc00::/7 unique-local
+  // An IPv4-mapped address. The URL parser rewrites ::ffff:127.0.0.1 into the
+  // hex form ::ffff:7f00:1, so both spellings have to be unwrapped to the IPv4
+  // address they carry — which a plain dotted-quad match never sees.
+  const mapped = h.startsWith('::ffff:') ? h.slice(7) : '';
+  if (mapped.includes('.')) return isPrivateHost(mapped);
+  const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(mapped);
+  if (hex) {
+    const bits = (hex[1].padStart(4, '0') + hex[2].padStart(4, '0'));
+    return privateV4(parseInt(bits.slice(0, 2), 16), parseInt(bits.slice(2, 4), 16));
+  }
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (!m) return false;
-  const [a, b] = [Number(m[1]), Number(m[2])];
-  if (a === 0 || a === 127 || a === 10) return true;          // this-host, loopback, private
-  if (a === 169 && b === 254) return true;                    // link-local incl. cloud metadata
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;           // 172.16.0.0/12
-  return false;
+  return privateV4(Number(m[1]), Number(m[2]));
 }
 
 // What may be attached to a message. Images go to vision models; the document
@@ -549,31 +669,47 @@ const isAllowedAttachment = (type, kind) =>
 // Fetch a remote attachment and convert it to a Base64 data URI, with the SSRF
 // guard. `kind` narrows what content-type is acceptable: an image_url part will
 // take nothing but an image, a file part will also take a document.
+//
+// Redirects are followed manually so every hop is re-checked: fetch's own
+// follow would happily deliver a public URL that 302s to 169.254.169.254,
+// which is the classic way past a first-URL-only guard.
 async function fetchRemoteAsDataUri(urlStr, kind = 'image') {
-  const parsed = new URL(urlStr);
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(`unsupported protocol: ${parsed.protocol}`);
-  }
-  const host = parsed.hostname.toLowerCase();
-  if (isPrivateHost(host)) {
-    throw new Error(`refusing private/internal network fetch: ${host}`);
-  }
+  const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+  let current = new URL(urlStr);
+  for (let hop = 0; ; hop++) {
+    if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+      throw new Error(`unsupported protocol: ${current.protocol}`);
+    }
+    const host = current.hostname.toLowerCase();
+    if (isPrivateHost(host)) {
+      throw new Error(`refusing private/internal network fetch: ${host}`);
+    }
 
-  const res = await fetch(urlStr, {
-    signal: AbortSignal.timeout(15_000),
-    headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-  });
-  if (!res.ok) throw new Error(`remote fetch failed with status ${res.status}`);
-  const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
-  if (!isAllowedAttachment(contentType, kind)) {
-    throw new Error(`unsupported content-type: ${contentType}`);
+    const res = await fetch(current, {
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15_000),
+      headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    });
+    if (REDIRECTS.has(res.status)) {
+      try { await res.body?.cancel(); } catch { /* already gone */ }
+      const location = res.headers.get('location');
+      if (!location) throw new Error('redirect carried no Location header');
+      if (hop >= 4) throw new Error('too many redirects');
+      current = new URL(location, current); // the next hop gets the same checks
+      continue;
+    }
+    if (!res.ok) throw new Error(`remote fetch failed with status ${res.status}`);
+    const contentType = (res.headers.get('content-type') || 'image/jpeg').split(';')[0].trim();
+    if (!isAllowedAttachment(contentType, kind)) {
+      throw new Error(`unsupported content-type: ${contentType}`);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    if (arrayBuffer.byteLength > MAX_ATTACHMENT_BYTES) {
+      throw new Error(`attachment too large: ${arrayBuffer.byteLength} bytes`);
+    }
+    const base64 = Buffer.from(arrayBuffer).toString('base64');
+    return `data:${contentType};base64,${base64}`;
   }
-  const arrayBuffer = await res.arrayBuffer();
-  if (arrayBuffer.byteLength > MAX_ATTACHMENT_BYTES) {
-    throw new Error(`attachment too large: ${arrayBuffer.byteLength} bytes`);
-  }
-  const base64 = Buffer.from(arrayBuffer).toString('base64');
-  return `data:${contentType};base64,${base64}`;
 }
 
 // The mime type a data URI declares, or '' when it is not a data URI.
@@ -698,13 +834,13 @@ async function extractUserParts(messages) {
 
 /* ------------------------------------------------------------ http plumbing */
 
-function readBody(req) {
+function readBody(req, limit = MAX_BODY) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const parts = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) { reject(new Error('body too large')); req.destroy(); return; }
+      if (size > limit) { reject(new Error('body too large')); req.destroy(); return; }
       parts.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
@@ -730,30 +866,70 @@ const oaiError = (res, status, message, type = 'invalid_request_error') =>
 // The video options a request may carry, filtered to what the model will take.
 // The app gates only `resolution` by model and sends the rest whenever they are
 // set, so this does the same rather than inventing stricter rules of its own.
+// What a model will take beyond a prompt. Computed when the response is built,
+// never cached onto the model — the video loaders land after the model list, so
+// a surface baked in at fetch time reports the fallback for the rest of the run.
+function optionSurface(id) {
+  if (kindOf(id) !== 'video') return null;
+  const provider = videoProviderOf(id);
+  const served = valuesFor(videoOptions.resolutions, provider);
+  return {
+    provider: provider ?? null,
+    aspectRatio: true,
+    stylePreprompt: true,
+    duration: /^seedance/i.test(id),
+    cameraFixed: /^seedance/i.test(id),
+    generateAudio: /^seedance/i.test(id),
+    resolutions: served.length ? served : (VIDEO_RESOLUTIONS_FALLBACK[provider] ?? null),
+    durations: valuesFor(videoOptions.durations, provider),
+    aspectRatios: valuesFor(videoOptions.aspectRatios, provider),
+    images: VIDEO_IMAGE_LIMITS[id] ?? null,
+  };
+}
+
 function videoOptionsFor(modelId, payload) {
   if (kindOf(modelId) !== 'video') return undefined;
   const bool = (v) => (typeof v === 'boolean' ? v : undefined);
+  const provider = videoProviderOf(modelId);
   // The app attaches these four only for a seedance model; veo and sora take
   // the prompt, the aspect ratio and the style, and nothing else.
   const seedance = /^seedance/i.test(modelId);
-  // A model absent from the table has no resolution concept at all — the web UI
-  // shows no control for it and never puts one on the wire. The app's own guard
-  // is looser (it passes anything for an unlisted model) but only because the UI
-  // has already constrained the choice; matching the wire is what matters here.
+
+  // What this provider is actually offered, straight from the loaders. Falling
+  // back to the bundle's table only matters when no tab is attached to ask.
+  const served = valuesFor(videoOptions.resolutions, provider);
+  const allowed = served.length ? served : (VIDEO_RESOLUTIONS_FALLBACK[provider] ?? []);
+  const durations = valuesFor(videoOptions.durations, provider);
+  const ratios = valuesFor(videoOptions.aspectRatios, provider);
+
+  const drop = (what, value, list) =>
+    log(`warning: ${modelId} does not offer ${what} ${value}${list.length ? ` (${list.join(', ')})` : ''}`);
+
   const resolution = String(payload.resolution ?? '').trim();
-  const allowed = VIDEO_RESOLUTIONS[modelId];
-  if (resolution && !allowed?.includes(resolution)) {
-    log(`warning: ${modelId} does not offer resolution ${resolution}${allowed ? ` (${allowed.join(', ')})` : ''}`);
-  }
+  const okResolution = Boolean(resolution) && allowed.includes(resolution);
+  if (resolution && !okResolution) drop('resolution', resolution, allowed);
+
   const duration = Number(payload.duration);
+  // Durations are a served short list, not a free number. Sending one outside it
+  // is accepted at submit and rejected later, once the quota is already spent.
+  const okDuration = Number.isFinite(duration) && duration > 0
+    && (!durations.length || durations.includes(duration));
+  if (Number.isFinite(duration) && !okDuration) drop('duration', duration, durations);
+
+  const ratio = String(payload.aspect_ratio ?? payload.aspectRatio ?? '').trim();
+  const okRatio = Boolean(ratio) && (!ratios.length || ratios.includes(ratio));
+  if (ratio && !okRatio) drop('aspect ratio', ratio, ratios);
+
+  const style = payload.style_preprompt ?? payload.stylePreprompt;
+
   return {
-    provider: videoProviderOf(modelId),
-    ...(payload.aspect_ratio || payload.aspectRatio ? { aspectRatio: String(payload.aspect_ratio ?? payload.aspectRatio) } : {}),
-    // A style is sent as its preprompt text, not as an id: the app looks the
-    // preset up in /loaders/list-video-styles and posts the `preprompt` field.
-    ...(payload.style_preprompt || payload.stylePreprompt ? { stylePreprompt: String(payload.style_preprompt ?? payload.stylePreprompt) } : {}),
-    ...(seedance && resolution && allowed?.includes(resolution) ? { resolution } : {}),
-    ...(seedance && Number.isFinite(duration) && duration > 0 ? { duration } : {}),
+    provider,
+    ...(okRatio ? { aspectRatio: ratio } : {}),
+    // A style is sent as its preprompt text, not as an id. A caller may name the
+    // preset instead — "Documentary" — and it is resolved to that text here.
+    ...(style ? { stylePreprompt: stylePreprompt(String(style)) } : {}),
+    ...(seedance && okResolution ? { resolution } : {}),
+    ...(seedance && okDuration ? { duration } : {}),
     ...(seedance && bool(payload.camera_fixed ?? payload.cameraFixed) !== undefined ? { cameraFixed: bool(payload.camera_fixed ?? payload.cameraFixed) } : {}),
     ...(seedance && bool(payload.generate_audio ?? payload.generateAudio) !== undefined ? { generateAudio: bool(payload.generate_audio ?? payload.generateAudio) } : {}),
   };
@@ -791,6 +967,22 @@ async function chatCompletions(req, res) {
   const thinking = String(payload.thinking_level ?? payload.thinkingLevel ?? '').trim().toLowerCase();
   const thinkingLevel = thinking ? thinkingLevelFor(model, thinking) : undefined;
   const video = videoOptionsFor(model, payload);
+
+  // An image style is sent by id; a tone and a format by their code. Each is
+  // resolved from whatever the caller named — English, Thai, or the code — and
+  // dropped with a warning when it matches no preset, rather than being passed
+  // through as a string the server will not recognise.
+  const preset = (rows, wanted, field, what) => {
+    if (!wanted) return undefined;
+    const hit = matchPreset(rows, wanted);
+    if (!hit) { log(`warning: no ${what} called ${wanted}`); return undefined; }
+    return hit[field];
+  };
+  const imageStyleId = kindOf(model) === 'image'
+    ? preset(styleOptions.imageStyles, payload.image_style ?? payload.imageStyle, 'id', 'image style')
+    : undefined;
+  const outputTone = preset(styleOptions.tones, payload.output_tone ?? payload.outputTone, 'code', 'tone');
+  const outputFormat = preset(styleOptions.formats, payload.output_format ?? payload.outputFormat, 'code', 'format');
   if (thinking && !thinkingLevel) log(`warning: ${model} does not offer thinking level ${thinking}`);
   const { text, parts } = await extractUserParts(payload.messages);
   if (!text && (!parts || parts.length === 0)) return oaiError(res, 400, 'no user message');
@@ -808,6 +1000,16 @@ async function chatCompletions(req, res) {
       'x-accel-buffering': 'no',
       ...corsHeaders(),
     });
+    // A video job can sit on one progress figure for minutes, and a stream that
+    // sends nothing for five hits the default body timeout in Node's fetch —
+    // undici's UND_ERR_BODY_TIMEOUT — killing a generation that was going to
+    // succeed, with the quota already spent. An SSE comment is ignored by every
+    // conforming parser and keeps the connection producing bytes.
+    const keepalive = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* closed */ } }, KEEPALIVE_MS);
+    keepalive.unref?.();
+    const stopKeepalive = () => clearInterval(keepalive);
+    res.on('close', stopKeepalive);
+
     const emit = (delta, finish = null) => {
       res.write(`data: ${JSON.stringify({
         id, object: 'chat.completion.chunk', created, model,
@@ -818,6 +1020,7 @@ async function chatCompletions(req, res) {
 
     const job = startChat({
       modelId: model, text, parts, aspectRatio: ratio, thinkingLevel, video,
+      imageStyleId, outputTone, outputFormat,
       onDelta: (part) => {
         if (part.kind === 'status') {
           if (TOOL_VISIBILITY === 'off') return;
@@ -830,11 +1033,13 @@ async function chatCompletions(req, res) {
         else emit({ content: part.text });
       },
       onDone: (finishReason) => {
+        stopKeepalive();
         emit({}, finishReason === 'length' ? 'length' : 'stop');
         res.write('data: [DONE]\n\n');
         res.end();
       },
       onError: (message) => {
+        stopKeepalive();
         res.write(`data: ${JSON.stringify({ error: { message, type: 'upstream_error' } })}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
@@ -849,6 +1054,7 @@ async function chatCompletions(req, res) {
   await new Promise((resolve) => {
     const job = startChat({
       modelId: model, text, parts, aspectRatio: ratio, thinkingLevel, video,
+      imageStyleId, outputTone, outputFormat,
       onDelta: (p) => {
         if (p.kind === 'status') { if (TOOL_VISIBILITY !== 'off') reasoning += `${p.text}\n`; return; }
         if (MEDIA_KINDS.has(p.kind)) { out += mediaMarkdown(p.kind, p.text, p.filename); return; }
@@ -898,6 +1104,8 @@ function extEvents(req, res) {
   const warm = (fn, ms) => setTimeout(() => { if (extClients.has(client)) fn().catch(() => {}); }, ms);
   warm(() => listModels({ force: true }), 500);
   warm(() => getQuota({ force: true }), 900);
+  warm(() => refreshVideoOptions(), 1300);
+  warm(() => refreshStyleOptions(), 1700);
 
   const ping = setInterval(() => res.write(': ping\n\n'), 15_000);
   req.on('close', () => {
@@ -913,7 +1121,7 @@ function extEvents(req, res) {
 
 async function extPost(req, res, kind) {
   let body;
-  try { body = JSON.parse(await readBody(req)); }
+  try { body = JSON.parse(await readBody(req, MAX_EXT_BODY)); }
   catch { return json(res, 400, { ok: false }); }
   const job = jobs.get(body.jobId);
   if (!job) return json(res, 200, { ok: false, reason: 'unknown job' });
@@ -922,6 +1130,13 @@ async function extPost(req, res, kind) {
   else if (kind === 'loader') {
     if (typeof body.raw === 'string') job.done(body.raw);
     else job.fail(body.message ?? 'loader fetch failed');
+  } else if (kind === 'assistant') {
+    // One channel for three shapes: a created id, a bound conversation, or a
+    // deletion. The caller knows which it asked for.
+    if (body.conversationId) job.done(body.conversationId);
+    else if (body.deleted) job.done('deleted');
+    else if (body.assistantId) job.done(body.assistantId);
+    else job.fail(body.message ?? 'assistant action failed');
   } else job.fail(body.message ?? 'extension reported an error');
   return json(res, 200, { ok: true });
 }
@@ -929,13 +1144,21 @@ async function extPost(req, res, kind) {
 /* --------------------------------------------------------------- the server */
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname.replace(/\/+$/, '') || '/';
-
+  // The Host check comes first and reads the raw header, because the URL
+  // construction below it throws on a malformed one — an async handler that
+  // throws before the try block is an unhandled rejection, and Node exits.
   if (!hostAllowed(req)) {
     res.writeHead(403, { 'content-type': 'text/plain' });
     return res.end('forbidden: unexpected Host header\n');
   }
+
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+  } catch {
+    return oaiError(res, 400, 'malformed request URL');
+  }
+  const path = url.pathname.replace(/\/+$/, '') || '/';
 
   if (req.method === 'OPTIONS') {
     // Without an explicit AIPASS_CORS_ORIGIN this preflight carries no
@@ -970,7 +1193,7 @@ const server = http.createServer(async (req, res) => {
           id: m.id, object: 'model', created: 0, owned_by: m.provider ?? 'aipass',
           name: m.name, free_credit: m.free, thinking: m.thinking,
           kind: m.kind, description: m.description, is_default: m.isDefault,
-          ...(m.options ? { options: m.options } : {}),
+          ...(optionSurface(m.id) ? { options: optionSurface(m.id) } : {}),
         })),
       });
     }
@@ -988,6 +1211,131 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         current: PINNED_CONVERSATION || conversationCache,
         conversations: conversationList.map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt })),
+      });
+    }
+
+    // The custom assistant that carries the agent's tool protocol. Listing is a
+    // plain loader read; creating goes through the extension, which owns the
+    // path and the intents it will post.
+    if (path === '/assistants' && req.method === 'GET') {
+      try {
+        const decoded = decodeTurboStream(await fetchLoader(LOADERS.assistants));
+        const found = [];
+        const walk = (v) => {
+          if (!v || typeof v !== 'object') return;
+          if (Array.isArray(v)) return void v.forEach(walk);
+          if (typeof v.id === 'string' && typeof (v.name ?? v.assistantName) === 'string') {
+            found.push({ id: v.id, name: v.name ?? v.assistantName, model: v.model ?? v.modelId ?? null });
+          }
+          Object.values(v).forEach(walk);
+        };
+        walk(decoded);
+        const seen = new Set();
+        return json(res, 200, { assistants: found.filter((a) => !seen.has(a.id) && seen.add(a.id)) });
+      } catch (err) {
+        return oaiError(res, 502, `could not list assistants: ${err.message}`);
+      }
+    }
+
+    if (path === '/assistants' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const spec = {
+        name: String(body.name ?? '').trim(),
+        detail: String(body.detail ?? '').trim(),
+        character: String(body.character ?? ''),
+        type: String(body.type ?? '').trim(),
+        model: String(body.model ?? '').trim(),
+        tags: Array.isArray(body.tags) ? body.tags.map(String).filter(Boolean) : [],
+      };
+      // The form enforces these before it will submit, so failing here saves a
+      // round trip and a half-made draft on the account.
+      const tooLong = spec.name.length > 100 ? 'name over 100 characters'
+        : spec.detail.length > 200 ? 'detail over 200 characters'
+        : spec.character.length > 1000 ? 'character over 1000 characters'
+        : '';
+      const missing = ['name', 'detail', 'character', 'type', 'model'].find((k) => !spec[k]);
+      if (missing) return oaiError(res, 400, `${missing} is required`);
+      if (!spec.tags.length) return oaiError(res, 400, 'at least one tag is required');
+      if (tooLong) return oaiError(res, 400, tooLong);
+
+      try {
+        const id = await new Promise((resolve, reject) => {
+          const job = new Job({
+            kind: 'assistant', spec, timeoutMs: 60_000,
+            onDelta: () => {}, onDone: resolve, onError: (m) => reject(new Error(m)),
+          });
+          job.dispatch();
+        });
+        log(`created assistant ${id} (${spec.name})`);
+        return json(res, 200, { id, name: spec.name });
+      } catch (err) {
+        return oaiError(res, 502, err.message);
+      }
+    }
+
+    // Start a conversation already bound to an assistant, so nobody has to open
+    // the web UI and copy an id out of the address bar.
+    if (path.startsWith('/assistants/') && path.endsWith('/chat') && req.method === 'POST') {
+      const assistantId = decodeURIComponent(path.slice('/assistants/'.length, -'/chat'.length));
+      if (!assistantId) return oaiError(res, 400, 'assistant id is required');
+      try {
+        const conversationId = await new Promise((resolve, reject) => {
+          const job = new Job({
+            kind: 'assistant', spec: { op: 'start-chat', assistantId }, timeoutMs: 60_000,
+            onDelta: () => {}, onDone: resolve, onError: (m) => reject(new Error(m)),
+          });
+          job.dispatch();
+        });
+        // Adopt it, the way /conversations/new does — the point of binding is
+        // that the next message goes to it.
+        conversationCache = conversationId;
+        conversationIsTemporary = false;
+        conversationIndex = 0;
+        log(`assistant ${assistantId} -> conversation ${conversationId}`);
+        return json(res, 200, { assistantId, conversation: conversationId });
+      } catch (err) {
+        return oaiError(res, 502, err.message);
+      }
+    }
+
+    if (path.startsWith('/assistants/') && req.method === 'DELETE') {
+      const assistantId = decodeURIComponent(path.slice('/assistants/'.length));
+      if (!assistantId) return oaiError(res, 400, 'assistant id is required');
+      try {
+        await new Promise((resolve, reject) => {
+          const job = new Job({
+            kind: 'assistant', spec: { op: 'delete', assistantId }, timeoutMs: 60_000,
+            onDelta: () => {}, onDone: resolve, onError: (m) => reject(new Error(m)),
+          });
+          job.dispatch();
+        });
+        log(`deleted assistant ${assistantId}`);
+        return json(res, 200, { deleted: assistantId });
+      } catch (err) {
+        return oaiError(res, 502, err.message);
+      }
+    }
+
+    if (path === '/style-options' && req.method === 'GET') {
+      if (url.searchParams.get('refresh') === '1' || !styleOptions.at) await refreshStyleOptions();
+      return json(res, 200, {
+        imageStyles: styleOptions.imageStyles.map((v) => ({ id: v.id, name: v.name_en, nameTh: v.name_th })),
+        tones: styleOptions.tones.map((v) => ({ code: v.code, name: v.nameEn, nameTh: v.nameTh })),
+        formats: styleOptions.formats.map((v) => ({ code: v.code, name: v.nameEn, nameTh: v.nameTh })),
+      });
+    }
+
+    if (path === '/video-options' && req.method === 'GET') {
+      if (url.searchParams.get('refresh') === '1' || !videoOptions.at) await refreshVideoOptions();
+      return json(res, 200, {
+        styles: videoOptions.styles.map((v) => ({
+          name: v.name_en, nameTh: v.name_th, preprompt: v.preprompt,
+        })),
+        byProvider: Object.fromEntries(VIDEO_PROVIDERS.map(([provider]) => [provider, {
+          resolutions: valuesFor(videoOptions.resolutions, provider),
+          durations: valuesFor(videoOptions.durations, provider),
+          aspectRatios: valuesFor(videoOptions.aspectRatios, provider),
+        }])),
       });
     }
 
@@ -1063,6 +1411,7 @@ const server = http.createServer(async (req, res) => {
     if (path === '/ext/done' && req.method === 'POST') return await extPost(req, res, 'done');
     if (path === '/ext/error' && req.method === 'POST') return await extPost(req, res, 'error');
     if (path === '/ext/loader' && req.method === 'POST') return await extPost(req, res, 'loader');
+    if (path === '/ext/assistant' && req.method === 'POST') return await extPost(req, res, 'assistant');
 
     if (path === '/status' || path === '/health') {
       return json(res, 200, {
@@ -1087,18 +1436,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.on('error', (err) => {
-  if (/** @type {any} */ (err).code === 'EADDRINUSE') {
-    console.error(`\x1b[31m✗ Port ${PORT} is already in use.\x1b[0m`);
-    console.error(`  Another bridge process is running. You can kill it with:\n  \x1b[36mfuser -k ${PORT}/tcp\x1b[0m  or  \x1b[36mpkill -f "bridge/server.mjs"\x1b[0m\n`);
-    process.exit(1);
-  }
-  throw err;
-});
-
 server.listen(PORT, HOST, () => {
   log(`aipass bridge on http://${HOST}:${PORT}`);
   log(`  default model : ${defaultModel}`);
   log(`  conversation  : ${PINNED_CONVERSATION || 'most recent on the account'}`);
   log('  waiting for the Chrome extension…');
 });
+
+// For tests: the SSRF guard's redirect behaviour cannot be driven through the
+// HTTP surface without a public host, so it is exercised directly, and the
+// imported server handle lets the test file release the port when it is done.
+export { isPrivateHost, fetchRemoteAsDataUri, server };

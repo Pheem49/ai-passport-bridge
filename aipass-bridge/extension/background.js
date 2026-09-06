@@ -6,14 +6,25 @@
 // Private Network Access checks; an extension request with host_permissions
 // does not.
 const DEFAULT_BRIDGE = 'http://127.0.0.1:8787';
-const RECONNECT_MS = 500;
+const RECONNECT_MS = 3000;
+const CYCLE_MS = 4 * 60 * 1000; // reconnect before Chrome's long-request ceiling
 
 let controller = null;
 let connected = false;
 let lastError = '';
 const jobTabs = new Map();
 
+// The content script's keepalive port only exists while a de.aipass.net tab is
+// open. With no tab the worker is evicted, the SSE stream dies with it, and the
+// bridge reports the extension as gone until the one-minute alarm revives it —
+// so an offscreen document holds a port of its own, which is a context Chrome
+// does not discard.
+//
+// One in-flight creation at a time: hasDocument() then createDocument() is
+// check-then-act, and this is called from the alarm, from connect(), and on a
+// port dropping. Same shape as connect() and the model refresh below.
 let offscreenSetup = null;
+
 function ensureOffscreenDocument() {
   if (typeof chrome.offscreen === 'undefined') return Promise.resolve();
   if (offscreenSetup) return offscreenSetup;
@@ -22,10 +33,14 @@ function ensureOffscreenDocument() {
       if (await chrome.offscreen.hasDocument?.()) return;
       await chrome.offscreen.createDocument({
         url: 'offscreen.html',
+        // The enum has no value for "keep the worker alive", which is the only
+        // thing this document does. BLOBS is a stand-in; nothing here handles a
+        // blob, and the justification says what is really going on.
         reasons: ['BLOBS'],
         justification: 'Holds a port open so the service worker survives while no aipass tab is open',
       });
     } catch (err) {
+      // Losing a creation race is the outcome we wanted anyway.
       if (!/single offscreen document/i.test(String(err?.message ?? err))) {
         console.warn('[aipass-bg] offscreen document:', err);
       }
@@ -47,21 +62,22 @@ const bridgeUrl = async () => {
 
 async function post(path, body) {
   try {
-    await fetch(`${await bridgeUrl()}${path}`, {
+    const res = await fetch(`${await bridgeUrl()}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
+    // Retrying would duplicate deltas, so a refused post is surfaced, not
+    // repeated — without this a rejected body (too large, unknown job) vanished
+    // and the caller waited out its timeout for a reply that never came.
+    if (!res.ok) {
+      lastError = `bridge refused ${path} with ${res.status}`;
+      console.warn('[aipass-bg] POST rejected:', path, res.status);
+    }
   } catch (err) {
     lastError = String(err?.message ?? err);
     console.warn('[aipass-bg] POST error:', path, lastError);
   }
-}
-
-let postQueue = Promise.resolve();
-function queuePost(path, body) {
-  postQueue = postQueue.then(() => post(path, body)).catch(() => {});
-  return postQueue;
 }
 
 async function findChatTab() {
@@ -86,9 +102,6 @@ function waitForComplete(tabId, timeoutMs = 15_000) {
   });
 }
 
-// A tab opened before the extension was loaded or reloaded has no content
-// script in it, and Chrome's memory saver can discard one entirely. Rather
-// than telling the user to reload, put the scripts back.
 async function ensureContentScript(tab) {
   const ping = () => chrome.tabs.sendMessage(tab.id, { type: 'ping' });
   let ok = false;
@@ -142,13 +155,10 @@ function handleEvent(name, data) {
 }
 
 async function connect() {
-  if (connected) return;
-  if (controller) {
-    try { controller.abort(); } catch { /* ignore */ }
-    controller = null;
-  }
+  if (controller) return;
   controller = new AbortController();
   const signal = controller.signal;
+  const cycle = setTimeout(() => controller?.abort(), CYCLE_MS);
 
   ensureOffscreenDocument();
 
@@ -188,6 +198,7 @@ async function connect() {
   } catch (err) {
     if (err?.name !== 'AbortError') lastError = String(err?.message ?? err);
   } finally {
+    clearTimeout(cycle);
     connected = false;
     controller = null;
     setTimeout(connect, RECONNECT_MS);
@@ -198,12 +209,12 @@ async function connect() {
 // is what stops Chrome evicting the worker.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'keepalive' && port.name !== 'offscreen-keepalive') return;
-  if (!connected) connect();
-  port.onMessage.addListener(() => {
-    if (!connected) connect();
-  });
+  connect(); // a tab just appeared, or the worker just woke
+  port.onMessage.addListener(() => {});
   port.onDisconnect.addListener(() => {
     void chrome.runtime.lastError;
+    // The content port cycles by design every four minutes; the offscreen one
+    // dropping means the document itself went away.
     if (port.name === 'offscreen-keepalive') ensureOffscreenDocument();
   });
 });
@@ -211,19 +222,10 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'from-page') {
     const p = msg.payload;
-    if (p.kind === 'chunk') queuePost('/ext/chunk', { jobId: p.jobId, parts: p.parts });
-    else if (p.kind === 'done') {
-      queuePost('/ext/done', { jobId: p.jobId, finishReason: p.finishReason })
-        .then(() => { jobTabs.delete(p.jobId); });
-    }
-    else if (p.kind === 'error') {
-      queuePost('/ext/error', { jobId: p.jobId, message: p.message })
-        .then(() => { jobTabs.delete(p.jobId); });
-    }
-    else if (p.kind === 'loader') {
-      queuePost('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message })
-        .then(() => { jobTabs.delete(p.jobId); });
-    }
+    if (p.kind === 'chunk') post('/ext/chunk', { jobId: p.jobId, parts: p.parts });
+    else if (p.kind === 'done') { jobTabs.delete(p.jobId); post('/ext/done', { jobId: p.jobId, finishReason: p.finishReason }); }
+    else if (p.kind === 'error') { jobTabs.delete(p.jobId); post('/ext/error', { jobId: p.jobId, message: p.message }); }
+    else if (p.kind === 'loader') { jobTabs.delete(p.jobId); post('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message }); }
     return;
   }
   if (msg?.type === 'status') {
@@ -242,19 +244,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'reconnect') { controller?.abort(); connect(); sendResponse({ ok: true }); return true; }
 });
 
-// Periodic alarm to ensure worker and offscreen document stay active
-chrome.alarms.create('keepalive', { periodInMinutes: 0.5 });
+// The worker can still be evicted; the alarm brings it back, and the connect()
+// guard makes a duplicate call harmless.
+chrome.alarms.create('keepalive', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(() => {
   ensureOffscreenDocument();
-  if (!connected) connect();
+  connect();
 });
+
 chrome.runtime.onStartup.addListener(() => {
   ensureOffscreenDocument();
-  if (!connected) connect();
+  connect();
 });
+
 chrome.runtime.onInstalled.addListener(() => {
   ensureOffscreenDocument();
-  if (!connected) connect();
+  connect();
 });
+
+// Initialize immediately
 ensureOffscreenDocument();
 connect();

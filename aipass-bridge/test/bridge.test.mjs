@@ -346,6 +346,16 @@ test('rejects an unexpected Host header (DNS-rebinding guard)', async () => {
   }
 });
 
+test('a malformed Host header is refused, and does not kill the process', async () => {
+  // `new URL(req.url, 'http://…')' throws on a header like this; the parse used
+  // to run before the try block, so one request was an unhandled rejection and
+  // Node exited. It must be answered, and the bridge must still be alive after.
+  const bad = await rawRequest(bridge.port, { host: 'bad host' });
+  assert.equal(bad.status, 403, 'a malformed Host is not in the allowlist');
+  const after = await fetch(`${bridge.base}/status`);
+  assert.ok(after.ok, 'the bridge survives the malformed Host');
+});
+
 test('sends no CORS header by default, so no web page can call the bridge', async () => {
   const res = await fetch(`${bridge.base}/status`);
   assert.equal(res.headers.get('access-control-allow-origin'), null);
@@ -404,6 +414,33 @@ test('an image URL pointing at a private address is dropped, not fetched', async
   const images = (job.parts ?? []).filter((p) => p.type === 'image');
   assert.equal(images.length, 0, 'private-network images must never reach the extension');
   assert.match(job.text, /describe this/, 'the text part still goes through');
+});
+
+test('IP spellings that mean a private address are refused too', async (t) => {
+  // The URL parser normalises integer/hex/octal IPv4 to dotted-quad, so those
+  // already meet the plain check; the mapped-IPv6 forms do not, and once meant
+  // loopback slipped past the guard.
+  const handler = scripted(['ok']);
+  const ext = await new FakeExtension(bridge.base, { onChat: handler }).connect();
+  t.after(() => ext.disconnect());
+
+  await post({
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'describe these' },
+        { type: 'image_url', image_url: { url: 'http://2130706433/x.png' } },        // 127.0.0.1 as an integer
+        { type: 'image_url', image_url: { url: 'http://0x7f000001/x.png' } },        // …as hex
+        { type: 'image_url', image_url: { url: 'http://[::ffff:127.0.0.1]/x.png' } }, // mapped loopback
+        { type: 'image_url', image_url: { url: 'http://[::ffff:169.254.0.1]/x.png' } }, // mapped link-local
+        { type: 'image_url', image_url: { url: 'http://[::]/x.png' } },              // unspecified
+      ],
+    }],
+  });
+
+  const job = ext.chats.at(-1);
+  const images = (job.parts ?? []).filter((p) => p.type === 'image');
+  assert.equal(images.length, 0, 'no private-address spelling may reach the extension');
 });
 
 test('creates a temporary conversation and repeats the flag on every turn', async (t) => {
@@ -684,4 +721,137 @@ test('models report the option surface each one actually accepts', async (t) => 
   assert.equal(byId['veo-3.1-fast-generate-001'].options.resolutions, null, 'veo offers no resolution');
   assert.deepEqual(byId['seedance-2.0-mini'].options.images, { maximumImages: 9, sourceImage: false, referenceImages: true });
   assert.equal(byId['gemini-3.1-flash-lite'].options, undefined, 'a chat model has no video surface');
+});
+
+test('a quiet stream still sends bytes, so a client body timeout cannot kill it', async (t) => {
+  const slow = await startBridge({ AIPASS_KEEPALIVE_MS: '120' });
+  t.after(() => slow.stop());
+  // says nothing for a while, the way a video job sitting on one percentage does
+  const ext = await new FakeExtension(slow.base, {
+    onChat: async (_j, e) => { await new Promise((r) => setTimeout(r, 700)); await e.text('done'); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const res = await fetch(`${slow.base}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gemini-3.1-flash-lite', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  const raw = await res.text();
+  assert.ok(raw.includes(': keepalive'), 'the stream must produce bytes while it waits');
+  // SSE comments are ignored by a conforming parser, so the payload is unchanged
+  assert.match(raw, /"content":"done"/);
+  assert.match(raw, /data: \[DONE\]/);
+});
+
+// Phase 1: the app serves what each video provider accepts. The bridge used to
+// hardcode a table lifted from the minified bundle, which disagreed with the
+// live loader — it listed 720p for seedance where the account is served 480p.
+const videoJob = async (ext, body) => {
+  await post({ model: 'seedance-2.0-mini', messages: [{ role: 'user', content: 'a street' }], ...body });
+  return ext.videos.at(-1);
+};
+
+test('served options beat the hardcoded table', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/v1/models?refresh=1`)).json()).data.length > 1);
+  await waitFor(async () => (await (await fetch(`${bridge.base}/video-options`)).json()).styles.length > 0);
+
+  // 720p is in the fallback table and NOT in what the loader serves
+  assert.equal((await videoJob(ext, { resolution: '720p' })).resolution, undefined);
+  assert.equal((await videoJob(ext, { resolution: '480p' })).resolution, '480p');
+});
+
+test('a duration outside the served list is dropped, not sent', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/video-options?refresh=1`)).json()).styles.length > 0);
+
+  // 8 was in our own README until the picker showed only 4 and 6
+  assert.equal((await videoJob(ext, { duration: 8 })).duration, undefined);
+  assert.equal((await videoJob(ext, { duration: 6 })).duration, 6);
+});
+
+test('an aspect ratio is checked against the provider, not the model', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/video-options?refresh=1`)).json()).styles.length > 0);
+
+  // 21:9 is a seedance row; 16:9 is an "all" row and reaches every provider
+  assert.equal((await videoJob(ext, { aspect_ratio: '21:9' })).aspectRatio, '21:9');
+  await post({ model: 'veo-3.1-fast-generate-001', messages: [{ role: 'user', content: 'x' }], aspect_ratio: '21:9' });
+  assert.equal(ext.videos.at(-1).aspectRatio, undefined, 'seedance-only ratios must not reach veo');
+  await post({ model: 'veo-3.1-fast-generate-001', messages: [{ role: 'user', content: 'x' }], aspect_ratio: '16:9' });
+  assert.equal(ext.videos.at(-1).aspectRatio, '16:9', 'an "all" row applies to every provider');
+});
+
+test('a style can be named instead of pasted', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/video-options?refresh=1`)).json()).styles.length > 0);
+
+  assert.equal((await videoJob(ext, { style_preprompt: 'Documentary' })).stylePreprompt,
+    'Documentary style, natural camera work.', 'the name resolves to the preset text');
+  assert.equal((await videoJob(ext, { style_preprompt: 'สารคดี' })).stylePreprompt,
+    'Documentary style, natural camera work.', 'the Thai name works too');
+  assert.equal((await videoJob(ext, { style_preprompt: 'something bespoke' })).stylePreprompt,
+    'something bespoke', 'raw text still passes through');
+});
+
+test('models report the served surface, not what was cached at startup', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/v1/models?refresh=1`)).json()).data.length > 1);
+  await waitFor(async () => (await (await fetch(`${bridge.base}/video-options?refresh=1`)).json()).styles.length > 0);
+
+  const byId = Object.fromEntries((await (await fetch(`${bridge.base}/v1/models`)).json()).data.map((m) => [m.id, m]));
+  assert.deepEqual(byId['seedance-2.0-mini'].options.resolutions, ['480p']);
+  assert.deepEqual(byId['seedance-2.0-mini'].options.durations, [4, 6]);
+  assert.deepEqual(byId['veo-3.1-fast-generate-001'].options.aspectRatios, ['16:9', '9:16'],
+    'veo gets the "all" rows and none of seedance\'s');
+  assert.equal(byId['veo-3.1-fast-generate-001'].options.resolutions, null);
+});
+
+// Image styles are sent by id; tone and format by the code the loader publishes.
+// Passing the display name straight through would send a string the server does
+// not recognise, so each is resolved or dropped.
+test('an image style is resolved to its id, by any name it is known by', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/style-options?refresh=1`)).json()).imageStyles.length > 0);
+
+  const send = async (body) => {
+    await post({ model: 'gpt-image-2', messages: [{ role: 'user', content: 'a cat' }], ...body });
+    return ext.chats.at(-1);
+  };
+  assert.equal((await send({ image_style: 'Anime' })).imageStyleId, 'img_anime');
+  assert.equal((await send({ image_style: 'อนิเมะ' })).imageStyleId, 'img_anime', 'the Thai name works');
+  assert.equal((await send({ image_style: 'img_minimal' })).imageStyleId, 'img_minimal', 'the id works');
+  assert.equal((await send({ image_style: 'Nonexistent' })).imageStyleId, undefined, 'an unknown preset is dropped');
+});
+
+test('an image style is not sent to a chat model', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/style-options?refresh=1`)).json()).imageStyles.length > 0);
+
+  await post({ model: 'gemini-3.1-flash-lite', messages: [{ role: 'user', content: 'hi' }], image_style: 'Anime' });
+  assert.equal(ext.chats.at(-1).imageStyleId, undefined);
+});
+
+test('tone and format travel as codes and apply to any model', async (t) => {
+  const ext = await new FakeExtension(bridge.base).connect();
+  t.after(() => ext.disconnect());
+  await waitFor(async () => (await (await fetch(`${bridge.base}/style-options?refresh=1`)).json()).tones.length > 0);
+
+  await post({
+    model: 'gemini-3.1-flash-lite', messages: [{ role: 'user', content: 'hi' }],
+    output_tone: 'Concise', output_format: 'table',
+  });
+  const job = ext.chats.at(-1);
+  assert.equal(job.outputTone, 'concise', 'the display name resolves to the code');
+  assert.equal(job.outputFormat, 'table');
+
+  await post({ model: 'gemini-3.1-flash-lite', messages: [{ role: 'user', content: 'hi' }], output_tone: 'shouty' });
+  assert.equal(ext.chats.at(-1).outputTone, undefined, 'an unknown tone is dropped, not forwarded');
 });

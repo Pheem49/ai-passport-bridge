@@ -84,6 +84,58 @@ export const modelsFixture = (models) => encodeTurboStream({
   'routes/loaders/list-models': { data: { models, gatewayFlash: null } },
 });
 
+export const assistantsFixture = (assistants) => encodeTurboStream({
+  'routes/loaders/list-ai-assistants': { data: { data: assistants, error: null } },
+});
+
+// The video option loaders all answer with this row shape: keyed by provider,
+// never by model id, with "all" applying to every provider.
+export const videoOptionFixture = (route, rows) => encodeTurboStream({
+  [`routes/loaders/${route}`]: { data: { data: rows, error: null } },
+});
+
+export const DEFAULT_VIDEO_OPTIONS = {
+  'list-video-resolutions': [
+    { id: 'r1', provider: 'seedance', label: '480p', value: '480p', is_default: true, is_active: true },
+  ],
+  'list-video-durations': [
+    { id: 'd1', provider: 'seedance', label: '4s', value: 4, is_default: true, is_active: true },
+    { id: 'd2', provider: 'seedance', label: '6s', value: 6, is_default: false, is_active: true },
+  ],
+  'list-video-aspect-ratios': [
+    { id: 'a1', provider: 'all', label: '16:9', value: '16:9', is_default: true, is_active: true },
+    { id: 'a2', provider: 'all', label: '9:16', value: '9:16', is_default: false, is_active: true },
+    { id: 'a3', provider: 'seedance', label: '21:9', value: '21:9', is_default: false, is_active: true },
+  ],
+  'list-video-styles': [
+    { id: 's1', name_en: 'Documentary', name_th: 'สารคดี', preprompt: 'Documentary style, natural camera work.', is_active: true },
+    { id: 's2', name_en: 'Anime', name_th: 'อนิเมะ', preprompt: 'Japanese anime visual style.', is_active: true },
+  ],
+};
+
+export const imageStylesFixture = () => encodeTurboStream({
+  'routes/loaders/list-image-styles': { data: { data: [
+    { id: 'img_anime', name_en: 'Anime', name_th: 'อนิเมะ', sort_order: 0, is_active: true },
+    { id: 'img_minimal', name_en: 'Minimal', name_th: 'มินิมอล', sort_order: 1, is_active: true },
+  ], error: null } },
+});
+
+// Output styles answer with two named lists, not one array — which is why the
+// bridge picks them out by name rather than through extractRows.
+export const outputStylesFixture = () => encodeTurboStream({
+  'routes/loaders/list-output-styles': { data: {
+    tones: [
+      { id: 'tone_concise', code: 'concise', nameEn: 'Concise', nameTh: 'กระชับ' },
+      { id: 'tone_academic', code: 'academic', nameEn: 'Academic', nameTh: 'วิชาการ' },
+    ],
+    formats: [
+      { id: 'fmt_table', code: 'table', nameEn: 'Table', nameTh: 'ตาราง' },
+      { id: 'fmt_bullets', code: 'bullet_points', nameEn: 'Bullet Points', nameTh: 'หัวข้อย่อย' },
+    ],
+    ok: true,
+  } },
+});
+
 export const conversationsFixture = (conversations) => encodeTurboStream({
   'routes/loaders/list-converstaions': { data: { conversations, gatewayFlash: null } },
 });
@@ -161,7 +213,7 @@ const DEFAULT_CONVERSATIONS = [
 // Stands in for the extension. `onChat` receives the job plus an emitter and
 // decides what the upstream would have streamed back.
 export class FakeExtension {
-  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, quota = quotaFixture() } = {}) {
+  constructor(base, { onChat, models = DEFAULT_MODELS, conversations = DEFAULT_CONVERSATIONS, quota = quotaFixture(), assistants = [], videoOptions = DEFAULT_VIDEO_OPTIONS } = {}) {
     this.base = base;
     this.quota = quota;
     this.onChat = onChat ?? (async (_job, e) => { await e.text('ok'); await e.done(); });
@@ -170,6 +222,9 @@ export class FakeExtension {
     this.chats = [];       // every chat job received
     this.created = [];     // every create-conversation job received
     this.videos = [];      // every video-generation job received
+    this.assistants = [];  // every assistant-creation job received
+    this.existingAssistants = assistants;
+    this.videoOptions = videoOptions;
     this.loaders = [];     // every loader url received
   }
 
@@ -241,8 +296,26 @@ export class FakeExtension {
         ? this.quota
         : job.url.includes('list-conversations')
         ? conversationsFixture(this.conversations)
+        : job.url.includes('list-ai-assistants')
+        ? assistantsFixture(this.existingAssistants)
+        : job.url.includes('list-image-styles')
+        ? imageStylesFixture()
+        : job.url.includes('list-output-styles')
+        ? outputStylesFixture()
+        : /list-video-(resolutions|durations|aspect-ratios|styles)/.test(job.url)
+        ? videoOptionFixture(job.url.match(/list-video-[a-z-]+/)[0], this.videoOptions[job.url.match(/list-video-[a-z-]+/)[0]] ?? [])
         : modelsFixture(this.models);
       return void this.post('/ext/loader', { jobId: job.jobId, raw });
+    }
+    if (job.kind === 'assistant') {
+      this.assistants.push(job);
+      if (job.op === 'start-chat') {
+        return void this.post('/ext/assistant', { jobId: job.jobId, assistantId: job.assistantId, conversationId: 'bound1234bound12' });
+      }
+      if (job.op === 'delete') {
+        return void this.post('/ext/assistant', { jobId: job.jobId, assistantId: job.assistantId, deleted: true });
+      }
+      return void this.post('/ext/assistant', { jobId: job.jobId, assistantId: `asst_fake_${this.assistants.length}` });
     }
     if (job.kind === 'video') this.videos.push(job);
     this.chats.push(job);
@@ -295,10 +368,13 @@ export function tempDir(files = {}) {
 // `stdin` may be a string (sent at once) or an array of [delayMs, line] pairs,
 // which models a user typing after the process is already running — necessary
 // for watch-mode tests, where a line sent before the prompt appears is lost.
-export function run(script, args, { cwd, stdin } = {}) {
+// `env` overrides the child's environment, e.g. PATH:'' to make a binary the
+// script would shell out to unfindable.
+export function run(script, args, { cwd, stdin, env } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [script, ...args], {
       cwd, stdio: [stdin != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      ...(env ? { env: { ...process.env, ...env } } : {}),
     });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
